@@ -1,0 +1,17 @@
+# In Terminal:
+mv ~/Downloads/PROMETHEUS_v1.zip /Users/aaron/Documents/Project/
+cd /Users/aaron/Documents/Project
+unzip PROMETHEUS_v1.zip
+# This creates:  /Users/aaron/Documents/Project/Prometheus/
+
+# Remove any previous attempt
+rm -rf /Users/aaron/Documents/Project/Prometheus/.venv
+
+# Create fresh venv using the system Python — NOT Anaconda
+/usr/bin/python3 -m venv /Users/aaron/Documents/Project/Prometheus/.venv
+
+/Users/aaron/Documents/Project/Prometheus/.venv/bin/pip install \
+  streamlit pandas numpy scipy plotly xlsxwriter openpyxl psycopg2-binary
+
+/Users/aaron/Documents/Project/Prometheus/.venv/bin/python -m streamlit run \
+  /Users/aaron/Documents/Project/Prometheus/dashboard/app.py
