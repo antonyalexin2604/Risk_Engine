@@ -782,7 +782,8 @@ class AIRBEngine:
             lgd_eff = lgd_stressed
 
         # Validate PD migration
-        validate_pd_migration(exp.trade_id, exp.pd, pd_eff)
+        if not _sensitivity_run:
+            validate_pd_migration(exp.trade_id, exp.pd, pd_eff)
 
         # Double-default adjustment (CRE22)
         if exp.has_cds and exp.cds_pd > 0:

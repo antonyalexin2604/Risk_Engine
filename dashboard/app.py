@@ -340,9 +340,9 @@ if page == "Capital Dashboard":
 
     st.markdown("")
     g1,g2,g3 = st.columns(3)
-    with g1: st.plotly_chart(gauge(cap["cet1_ratio"],0.045,"CET1 Ratio"),        use_container_width=True)
-    with g2: st.plotly_chart(gauge(cap["tier1_ratio"],0.060,"Tier 1 Ratio"),      use_container_width=True)
-    with g3: st.plotly_chart(gauge(cap["total_cap_ratio"],0.080,"Total Capital"), use_container_width=True)
+    with g1: st.plotly_chart(gauge(cap["cet1_ratio"],0.045,"CET1 Ratio"),        width="stretch")
+    with g2: st.plotly_chart(gauge(cap["tier1_ratio"],0.060,"Tier 1 Ratio"),      width="stretch")
+    with g3: st.plotly_chart(gauge(cap["total_cap_ratio"],0.080,"Total Capital"), width="stretch")
 
     sec("RISK-WEIGHTED ASSETS — FIVE-PART BREAKDOWN (RBC20.9)")
     comps = ["Credit (A-IRB)","CCR (SA-CCR/IMM)","Market (FRTB)","CVA (MAR50)","CCP (CRE54)"]
@@ -364,7 +364,7 @@ if page == "Capital Dashboard":
             font=dict(family="IBM Plex Mono", size=15, color="#0f172a"))
         fig_pie.update_layout(**PLOT(340, 10), showlegend=True,
                                legend=LEG("v", 0.5, 1.02))
-        st.plotly_chart(fig_pie, use_container_width=True)
+        st.plotly_chart(fig_pie, width="stretch")
     with right:
         vbar = [v/1e6 for v in vals]
         fig_bar = go.Figure(go.Bar(
@@ -377,7 +377,7 @@ if page == "Capital Dashboard":
         ))
         fig_bar.update_layout(**PLOT(340, 10), xaxis_title="USD Millions")
         fig_bar.update_xaxes(range=[0, max(vbar)*1.30])
-        st.plotly_chart(fig_bar, use_container_width=True)
+        st.plotly_chart(fig_bar, width="stretch")
 
     sec("CAPITAL STACK")
     sc1,sc2,sc3,sc4 = st.columns(4)
@@ -443,7 +443,7 @@ elif page == "Derivative Portfolios":
         text=[f"${v/1e6:.2f}M" for v in addons.values()],
         textposition="outside", textfont=dict(family="IBM Plex Mono",size=10,color="#64748b")))
     fig_add.update_layout(**PLOT(280,10), yaxis_title="USD Millions")
-    st.plotly_chart(fig_add, use_container_width=True)
+    st.plotly_chart(fig_add, width="stretch")
 
     sec("ALL DERIVATIVE PORTFOLIOS")
     rows=[]
@@ -454,7 +454,7 @@ elif page == "Derivative Portfolios":
                      "SA-CCR EAD":fmt_bn(p["saccr"]["ead"]),
                      "IMM EAD":fmt_bn(imm_r.get("ead_imm",0)),
                      "CCR RWA":fmt_bn(p["rwa_ccr"]),"Market RWA":fmt_bn(p["rwa_market"])})
-    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+    st.dataframe(pd.DataFrame(rows),width="stretch",hide_index=True)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3 · BANKING BOOK
@@ -482,7 +482,7 @@ elif page == "Banking Book":
     tdf["correlation"]=tdf["correlation"].map(lambda x:f"{x:.4f}")
     tdf["capital_k"]  =tdf["capital_k"].map(lambda x:f"{x*100:.3f}%")
     tdf.columns=["Trade ID","PD","LGD","EAD","RWA","EL","Corr R","Capital K"]
-    st.dataframe(tdf, use_container_width=True, hide_index=True)
+    st.dataframe(tdf, width="stretch", hide_index=True)
 
     sec("PD vs CAPITAL K — VASICEK PROFILE")
     all_t=[]
@@ -498,7 +498,7 @@ elif page == "Banking Book":
             hovertemplate="<b>%{text}</b><br>PD:%{x:.3f} K:%{y:.3f}<extra></extra>",
             text=sub["trade_id"]))
     fig_sc.update_layout(**PLOT(400,10),xaxis_title="PD",yaxis_title="Capital K")
-    st.plotly_chart(fig_sc, use_container_width=True)
+    st.plotly_chart(fig_sc, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4 · MARKET RISK
@@ -513,7 +513,7 @@ elif page == "Market Risk (FRTB)":
             "SBM Total":fmt_bn(p["frtb"]["sbm_total"]),"ES 10d":fmt_bn(p["frtb"]["es_10d"]),
             "ES Stressed":fmt_bn(p["frtb"]["es_stressed"]),"IMA Total":fmt_bn(p["frtb"]["ima_total"]),
             "Market RWA":fmt_bn(p["frtb"]["rwa_market"])} for p in drv]
-    st.dataframe(pd.DataFrame(mrows),use_container_width=True,hide_index=True)
+    st.dataframe(pd.DataFrame(mrows),width="stretch",hide_index=True)
 
     sec("SBM COMPONENT BREAKDOWN — DELTA · VEGA · CURVATURE")
     sbm_df=pd.DataFrame([{"Portfolio":p["portfolio_id"],
@@ -526,7 +526,7 @@ elif page == "Market Risk (FRTB)":
                                   marker_color=col_,opacity=0.85))
     fig_sbm.update_layout(**PLOT(360,10),barmode="group",yaxis_title="USD Millions",
                            legend=LEG())
-    st.plotly_chart(fig_sbm, use_container_width=True)
+    st.plotly_chart(fig_sbm, width="stretch")
 
     sec("SBM vs IMA — METHOD COMPARISON")
     cmp_df=pd.DataFrame([{"Portfolio":p["portfolio_id"],
@@ -538,7 +538,7 @@ elif page == "Market Risk (FRTB)":
                                   marker_color=col_,opacity=0.85))
     fig_cmp.update_layout(**PLOT(340,10),barmode="group",yaxis_title="USD Millions",
                            legend=LEG())
-    st.plotly_chart(fig_cmp, use_container_width=True)
+    st.plotly_chart(fig_cmp, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 5 · IMM EXPOSURE PROFILES
@@ -582,7 +582,7 @@ elif page == "IMM Exposure Profiles":
         fig_exp.update_layout(**PLOT(420,10),
             xaxis_title="Time (years)",yaxis_title="Exposure (USD Millions)",
             legend=LEG("h",-0.15,0))
-        st.plotly_chart(fig_exp, use_container_width=True)
+        st.plotly_chart(fig_exp, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 6 · RISK LIMITS
@@ -645,7 +645,7 @@ elif page == "Backtesting":
         "Multiplier":["1.50","1.70–1.92","2.00"],
         "Supervisory Action":["No action","Add-on; regulator review","Model revocation risk"],
         "Active":["← Active" if zone=="GREEN" else "","← Active" if zone=="AMBER" else "","← Active" if zone=="RED" else ""],
-    }),use_container_width=True,hide_index=True)
+    }),width="stretch",hide_index=True)
 
     sec("P&L vs VAR — 250 DAY LOOKBACK")
     rng=np.random.default_rng(42)
@@ -662,7 +662,7 @@ elif page == "Backtesting":
     fig_bt.update_layout(**PLOT(400,10),
         xaxis_title="Trading Day",yaxis_title="P&L (USD 000s)",
         legend=LEG())
-    st.plotly_chart(fig_bt, use_container_width=True)
+    st.plotly_chart(fig_bt, width="stretch")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 8 · REPORTS
@@ -734,7 +734,7 @@ elif page == "Reports":
                 fname=f"PROMETHEUS_{date_str}.csv"
                 st.download_button("⬇  Download CSV",df_out.to_csv(index=False).encode(),fname,"text/csv")
             sec("PREVIEW")
-            st.dataframe(df_out,use_container_width=True,hide_index=True)
+            st.dataframe(df_out,width="stretch",hide_index=True)
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown(

@@ -41,8 +41,8 @@ from backend.engines.a_irb import BankingBookExposure
 
 N_DERIVATIVE_PORTFOLIOS = 20    # number of derivative portfolios generated
 N_BANKING_PORTFOLIOS    = 20    # number of banking book portfolios generated
-N_TRADES_MIN_DRV        = 200   # min trades per derivative portfolio
-N_TRADES_MAX_DRV        = 300   # max trades per derivative portfolio
+N_TRADES_MIN_DRV        = 8   # min trades per derivative portfolio
+N_TRADES_MAX_DRV        = 15   # max trades per derivative portfolio
 N_EXP_MIN_BBK           = 8     # min exposures per banking book portfolio
 N_EXP_MAX_BBK           = 15    # max exposures per banking book portfolio
 
