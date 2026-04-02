@@ -190,9 +190,26 @@ class BankingBookExposure:
     cds_pd:             float = 0.0 # Guarantor PD (for double-default)
     cds_lgd:            float = 0.45
     provisions:         float = 0.0 # Specific provisions held
-    sector:             str = "UNKNOWN"
-    
-    # NEW: Term structure & EAD evolution
+    sector:             str   = "UNKNOWN"
+
+    # ── Funded collateral (CRE32.10–32.14) ───────────────────────────────────
+    collateral_type:    str   = "NONE"
+    collateral_value:   float = 0.0
+    collateral_he:      float = 0.0
+
+    # ── Guarantee / unfunded protection (CRE32.23–32.27) ────────────────────
+    has_guarantee:      bool  = False
+    guarantor_pd:       float = 0.0
+    guarantor_lgd:      float = 0.45
+    guarantee_coverage: float = 0.0
+
+    # ── CDS partial coverage (CRE22) ─────────────────────────────────────────
+    cds_coverage:       float = 1.0
+
+    # ── On-balance-sheet netting – retail only (CRE32.63) ────────────────────
+    deposit_offset:     float = 0.0
+
+    # ── Term structure & EAD evolution ───────────────────────────────────────
     pd_term_structure:  Optional[PDTermStructure] = None
     ead_schedule:       Optional[Dict[float, float]] = None  # {time_year: ead_amount}
     
@@ -253,6 +270,14 @@ class AIRBResult:
     validation_warnings: List[str] = field(default_factory=list)
     data_quality_score: float = 1.0     # 0.0-1.0 confidence
     
+    # Mitigant tracking
+    rwa_pre_mitigant:     float = 0.0
+    rwa_mitigant_benefit: float = 0.0
+    lgd_pre_mitigant:     float = 0.0
+    lgd_star:             float = 0.0
+    pd_pre_mitigant:      float = 0.0
+    mitigant_type:        str   = "NONE"
+
     # Performance tracking
     computation_time_ms: float = 0.0
     confidence_level:   float = 0.95
@@ -460,6 +485,31 @@ def double_default_pd(pd_obligor: float, pd_guarantor: float) -> float:
     rho_gg = 0.70   # intra-financial correlation
     pdd = (1 - rho_gg) * pd_obligor * pd_guarantor + rho_gg * min(pd_obligor, pd_guarantor)
     return min(pdd, pd_obligor)
+
+
+_COLLATERAL_PARAMS = {
+    "FINANCIAL":      (0.00, 0.15),
+    "RECEIVABLES":    (0.20, 0.40),
+    "RESIDENTIAL_RE": (0.20, 0.40),
+    "COMMERCIAL_RE":  (0.20, 0.40),
+    "OTHER_PHYSICAL": (0.25, 0.40),
+    "NONE":           (None, 1.00),
+}
+_LGD_FLOORS_SECURED = {
+    "FINANCIAL": 0.00, "RECEIVABLES": 0.10,
+    "RESIDENTIAL_RE": 0.10, "COMMERCIAL_RE": 0.10, "OTHER_PHYSICAL": 0.15,
+}
+
+def compute_lgd_star(ead, lgd_u, col_val, col_type, he=0.0, asset_class="CORP"):
+    """CRE32.10 LGD* = (EU/E_gross)*LGDU + (ES/E_gross)*LGDS"""
+    lgds, hc = _COLLATERAL_PARAMS.get(col_type.upper(), (None, 1.0))
+    if lgds is None or col_val <= 0 or ead <= 0:
+        return lgd_u, 0.0, ead
+    e_gross = ead * (1 + he)
+    es = min(col_val * (1 - hc), e_gross)
+    eu = e_gross - es
+    lgd_star = (eu / e_gross) * lgd_u + (es / e_gross) * lgds
+    return max(lgd_star, _LGD_FLOORS_SECURED.get(col_type.upper(), 0.25)), es, eu
 
 def apply_market_regime_stress(
     pd_base: float,
@@ -785,15 +835,47 @@ class AIRBEngine:
         if not _sensitivity_run:
             validate_pd_migration(exp.trade_id, exp.pd, pd_eff)
 
-        # Double-default adjustment (CRE22)
+        # ── CRM chain (CRE32) ───────────────────────────────────────────────────
+        pd_pre_mit  = pd_eff
+        lgd_pre_mit = lgd_eff
+        mit_types   = []
+
+        # (A) Retail deposit netting — EAD (CRE32.63)
+        dep = getattr(exp, "deposit_offset", 0.0)
+        if dep > 0 and exp.asset_class.startswith("RETAIL"):
+            ead_used = max(exp.ead - dep, 0.0)
+            mit_types.append("NETTING")
+        else:
+            ead_used = exp.ead
+
+        # (B) Funded collateral → LGD* (CRE32.10)
+        col_t = getattr(exp, "collateral_type",  "NONE")
+        col_v = getattr(exp, "collateral_value", 0.0)
+        col_h = getattr(exp, "collateral_he",    0.0)
+        if col_t.upper() != "NONE" and col_v > 0:
+            lgd_eff, _, _ = compute_lgd_star(ead_used, lgd_eff, col_v, col_t, col_h, exp.asset_class)
+            mit_types.append("COLLATERAL")
+
+        # (C) Guarantee → PD substitution (CRE32.24–32.27)
+        if getattr(exp, "has_guarantee", False) and getattr(exp, "guarantor_pd", 0.0) > 0:
+            cov = max(0.0, min(getattr(exp, "guarantee_coverage", 0.0), 1.0))
+            if cov > 0:
+                pd_g   = max(exp.guarantor_pd, AIRB.pd_floor)
+                lgd_g  = getattr(exp, "guarantor_lgd", 0.45)
+                pd_eff  = max(cov * pd_g  + (1-cov) * pd_eff,  AIRB.pd_floor)
+                lgd_eff = cov * lgd_g + (1-cov) * lgd_eff
+                mit_types.append("GUARANTEE")
+
+        # (D) CDS double-default — partial coverage (CRE22)
         if exp.has_cds and exp.cds_pd > 0:
-            pd_before = pd_eff
-            pd_eff  = double_default_pd(pd_eff, max(exp.cds_pd, AIRB.pd_floor))
-            lgd_eff = exp.cds_lgd
-            logger.debug(
-                "Trade %s: double-default — PD %.4f%% → %.4f%%",
-                exp.trade_id, pd_before*100, pd_eff*100
-            )
+            cds_cov = max(0.0, min(getattr(exp, "cds_coverage", 1.0), 1.0))
+            if cds_cov > 0:
+                pd_dd   = double_default_pd(pd_eff, max(exp.cds_pd, AIRB.pd_floor))
+                pd_eff  = cds_cov * pd_dd       + (1-cds_cov) * pd_eff
+                lgd_eff = cds_cov * exp.cds_lgd + (1-cds_cov) * lgd_eff
+                mit_types.append("CDS")
+
+        mitigant_label = "+".join(mit_types) if mit_types else "NONE"
 
         # Sector & concentration-adjusted correlation
         R = sector_correlation_adjustment(
@@ -806,9 +888,12 @@ class AIRBEngine:
             b = 0.0
             M_eff = 1.0
 
-        K = capital_requirement_k(pd_eff, lgd_eff, M_eff, R, b)
-        ead_used = exp.ead  # Could use exp.get_ead_at_time(M_eff) if schedule exists
-        rwa = rwa_from_k(K, ead_used)
+        K    = capital_requirement_k(pd_eff, lgd_eff, M_eff, R, b)
+        rwa  = rwa_from_k(K, ead_used)
+        R_p  = asset_correlation(pd_pre_mit, exp.asset_class)
+        b_p  = maturity_adjustment(pd_pre_mit, M_eff)
+        K_p  = capital_requirement_k(pd_pre_mit, lgd_pre_mit, M_eff, R_p, b_p)
+        rwa_pre = rwa_from_k(K_p, exp.ead)
         el  = pd_eff * lgd_eff * ead_used
         el_diff = el - exp.provisions
         
@@ -843,9 +928,15 @@ class AIRBEngine:
             el_diff            = el_diff,
             rwa_drivers        = rwa_drivers,
             pd_stressed        = pd_eff if self.config.use_stressed_params else 0.0,
-            validation_warnings= warnings,
-            data_quality_score = 1.0 if not warnings else 0.85,
-            computation_time_ms= computation_time_ms,
+            validation_warnings = warnings,
+            data_quality_score  = 1.0 if not warnings else 0.85,
+            computation_time_ms = computation_time_ms,
+            rwa_pre_mitigant    = rwa_pre,
+            rwa_mitigant_benefit= max(rwa_pre - rwa, 0.0),
+            lgd_pre_mitigant    = lgd_pre_mit,
+            lgd_star            = lgd_eff,
+            pd_pre_mitigant     = pd_pre_mit,
+            mitigant_type       = mitigant_label,
         )
         
         # Compute sensitivity analysis
@@ -1062,22 +1153,38 @@ class AIRBEngine:
         if failed_trades:
             logger.warning("A-IRB: %d trades failed — %s", len(failed_trades), failed_trades[:3])
 
+        # Mitigant benefit aggregates
+        total_rwa_pre_mit = sum(r.rwa_pre_mitigant     for r in results)
+        total_mit_benefit = sum(r.rwa_mitigant_benefit  for r in results)
+        n_mitigated       = sum(1 for r in results if r.mitigant_type != "NONE")
+        # Breakdown by channel
+        mit_by_type: dict = {}
+        for r in results:
+            for t in r.mitigant_type.split("+"):
+                if t and t != "NONE":
+                    mit_by_type[t] = mit_by_type.get(t, 0.0) + r.rwa_mitigant_benefit
+
         return {
-            "trade_results":        results,
-            "total_rwa":            total_rwa,
-            "total_el":             total_el,
-            "total_ead":            total_ead,
-            "el_shortfall":         el_shortfall,
-            "avg_risk_weight":      total_rwa / total_ead if total_ead > 0 else 0,
-            "num_trades_processed": len(results),
-            "num_trades_failed":    len(failed_trades),
-            "avg_quality_score":    avg_quality_score,
-            "validation_warnings":  warnings_count,
+            "trade_results":            results,
+            "total_rwa":                total_rwa,
+            "total_el":                 total_el,
+            "total_ead":                total_ead,
+            "el_shortfall":             el_shortfall,
+            "avg_risk_weight":          total_rwa / total_ead if total_ead > 0 else 0,
+            "num_trades_processed":     len(results),
+            "num_trades_failed":        len(failed_trades),
+            "avg_quality_score":        avg_quality_score,
+            "validation_warnings":      warnings_count,
             "total_computation_time_ms": total_computation_time,
             "avg_time_per_trade_ms":    total_computation_time / len(results) if results else 0,
-            "rwa_sensitivity_pd":   total_rwa_sensitivity_pd,
-            "rwa_sensitivity_lgd":  total_rwa_sensitivity_lgd,
-            "rwa_sensitivity_ead":  total_rwa_sensitivity_ead,
+            "rwa_sensitivity_pd":       total_rwa_sensitivity_pd,
+            "rwa_sensitivity_lgd":      total_rwa_sensitivity_lgd,
+            "rwa_sensitivity_ead":      total_rwa_sensitivity_ead,
+            # ── Mitigant benefit attribution ─────────────────────────────────
+            "total_rwa_pre_mitigant":   total_rwa_pre_mit,
+            "total_mitigant_benefit":   total_mit_benefit,
+            "mitigant_coverage_pct":    100.0 * n_mitigated / len(results) if results else 0.0,
+            "mitigant_benefit_by_type": mit_by_type,
         }
     
     def compute_portfolio_from_universal_trades(self, trades: List[object]) -> Dict:

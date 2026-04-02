@@ -147,15 +147,23 @@ class PrometheusRunner:
                 "portfolio_id":   pid,
                 "counterparty":   port["counterparty"]["name"],
                 "exposure_count": len(port["exposures"]),
-                "total_ead":      airb_summary["total_ead"],
-                "total_rwa":      airb_summary["total_rwa"],
-                "total_el":       airb_summary["total_el"],
-                "el_shortfall":   airb_summary["el_shortfall"],
-                "avg_risk_weight":airb_summary["avg_risk_weight"],
+                "total_ead":            airb_summary["total_ead"],
+                "total_rwa":            airb_summary["total_rwa"],
+                "total_el":             airb_summary["total_el"],
+                "el_shortfall":         airb_summary["el_shortfall"],
+                "avg_risk_weight":      airb_summary["avg_risk_weight"],
+                "total_rwa_pre_mit":    airb_summary.get("total_rwa_pre_mitigant", airb_summary["total_rwa"]),
+                "total_mit_benefit":    airb_summary.get("total_mitigant_benefit", 0.0),
+                "mitigant_coverage_pct":airb_summary.get("mitigant_coverage_pct", 0.0),
+                "mitigant_by_type":     airb_summary.get("mitigant_benefit_by_type", {}),
                 "airb_trades": [
                     {"trade_id": r.trade_id, "pd": r.pd_applied, "lgd": r.lgd_applied,
                      "ead": r.ead_applied, "rwa": r.rwa, "el": r.el,
-                     "correlation": r.correlation_r, "capital_k": r.capital_req_k}
+                     "correlation": r.correlation_r, "capital_k": r.capital_req_k,
+                     "rwa_pre_mitigant": r.rwa_pre_mitigant,
+                     "rwa_mitigant_benefit": r.rwa_mitigant_benefit,
+                     "lgd_pre": r.lgd_pre_mitigant, "lgd_star": r.lgd_star,
+                     "mitigant_type": r.mitigant_type}
                     for r in airb_summary["trade_results"]
                 ],
             })

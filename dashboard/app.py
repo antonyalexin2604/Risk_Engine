@@ -489,23 +489,96 @@ elif page == "Banking Book":
 
     pid   = st.selectbox("Portfolio",[p["portfolio_id"] for p in bbk],label_visibility="collapsed")
     pdata = next(p for p in bbk if p["portfolio_id"]==pid)
-    c1,c2,c3,c4 = st.columns(4)
-    kpi(c1,"Total EAD",    fmt_bn(pdata["total_ead"]),"Exposure at Default","A-IRB","t-blue")
-    kpi(c2,"Total RWA",    fmt_bn(pdata["total_rwa"]),"Risk-Weighted Assets","CRE31.4","t-blue")
-    kpi(c3,"Expected Loss",fmt_bn(pdata["total_el"]), "PD × LGD × EAD","EL","t-warn")
-    sf=pdata["el_shortfall"]
-    kpi(c4,"EL Shortfall", fmt_bn(sf),"vs Provisions (CRE35)",
-        "Shortfall" if sf>0 else "Provisioned","t-bad" if sf>0 else "t-ok")
+    rwa_pre = pdata.get("total_rwa_pre_mit", pdata["total_rwa"])
+    mit_ben = pdata.get("total_mit_benefit", 0.0)
+    mit_red = 100.0*(rwa_pre - pdata["total_rwa"])/rwa_pre if rwa_pre > 0 else 0.0
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
+    kpi(c1,"Total EAD",     fmt_bn(pdata["total_ead"]), "Exposure at Default", "A-IRB",            "t-blue")
+    kpi(c2,"RWA (pre CRM)", fmt_bn(rwa_pre),            "Before mitigants",    "Gross",            "t-stone")
+    kpi(c3,"RWA (post CRM)",fmt_bn(pdata["total_rwa"]), "After all CRM",       "CRE31.4",          "t-blue")
+    kpi(c4,"CRM Benefit",   fmt_bn(mit_ben),            "RWA saved by CRM",    f"{mit_red:.1f}% reduction","t-ok" if mit_ben>0 else "t-stone")
+    kpi(c5,"Expected Loss", fmt_bn(pdata["total_el"]),  "PD × LGD × EAD",     "EL",               "t-warn")
+    sf = pdata["el_shortfall"]
+    kpi(c6,"EL Shortfall",  fmt_bn(sf),                 "vs Provisions (CRE35)","Shortfall" if sf>0 else "Provisioned","t-bad" if sf>0 else "t-ok")
+
+    # ── CRM benefit decomposition by channel ─────────────────────────────────
+    mit_by_type = pdata.get("mitigant_by_type", {})
+    if any(v > 0 for v in mit_by_type.values()):
+        sec("CRM BENEFIT BY CHANNEL — CRE32")
+        m1,m2,m3,m4 = st.columns(4)
+        channel_map = [("COLLATERAL","Funded Collateral","Pledged assets → LGD*"),
+                       ("GUARANTEE","Guarantees","Guarantor PD substitution"),
+                       ("CDS","CDS / Double-Default","DD PD reduction"),
+                       ("NETTING","Deposit Netting","EAD offset (retail)")]
+        for col_w,(key,label,desc) in zip([m1,m2,m3,m4], channel_map):
+            val = mit_by_type.get(key, 0.0)
+            pct_s = f"{100*val/rwa_pre:.1f}% RWA saved" if rwa_pre>0 and val>0 else "not active"
+            kpi(col_w, label, fmt_bn(val), desc, pct_s, "t-ok" if val>0 else "t-stone")
+        # Stacked horizontal bar across all channels
+        channels = [(k,l) for k,l,_ in channel_map if mit_by_type.get(k,0)>0]
+        if channels:
+            c_cols = [C["teal"],C["blue"],C["amber"],C["green"]]
+            fig_m = go.Figure()
+            for (key,label),colour in zip(channels, c_cols):
+                v = mit_by_type.get(key,0)
+                fig_m.add_trace(go.Bar(
+                    name=label, x=[v/1e6], y=["CRM Benefit"],
+                    orientation="h", marker_color=colour, opacity=0.85,
+                    text=[f"${v/1e6:.1f}M"], textposition="inside",
+                    textfont=dict(family="IBM Plex Mono", size=9, color="#fff"),
+                ))
+            fig_m.update_layout(**PLOT(120,10), barmode="stack",
+                                xaxis_title="USD Millions", legend=LEG())
+            st.plotly_chart(fig_m)
+        st.markdown("")
 
     sec("EXPOSURE DETAIL — TRADE LEVEL")
     tdf = pd.DataFrame(pdata["airb_trades"])
-    tdf["pd"]         =tdf["pd"].map(lambda x:f"{x*100:.3f}%")
-    tdf["lgd"]        =tdf["lgd"].map(lambda x:f"{x*100:.1f}%")
-    for c2_ in ["ead","rwa","el"]: tdf[c2_]=tdf[c2_].map(fmt_bn)
-    tdf["correlation"]=tdf["correlation"].map(lambda x:f"{x:.4f}")
-    tdf["capital_k"]  =tdf["capital_k"].map(lambda x:f"{x*100:.3f}%")
-    tdf.columns=["Trade ID","PD","LGD","EAD","RWA","EL","Corr R","Capital K"]
+    tdf["pd"]  = tdf["pd"].map(lambda x: f"{x*100:.3f}%")
+    tdf["lgd"] = tdf["lgd"].map(lambda x: f"{x*100:.1f}%")
+    if "lgd_pre" in tdf.columns:
+        tdf["lgd_pre"] = tdf["lgd_pre"].map(lambda x: f"{x*100:.1f}%")
+    for c_ in ["ead","rwa","el"]:
+        tdf[c_] = tdf[c_].map(fmt_bn)
+    if "rwa_pre_mitigant" in tdf.columns:
+        tdf["rwa_pre_mitigant"] = tdf["rwa_pre_mitigant"].map(fmt_bn)
+    if "rwa_mit_benefit" in tdf.columns:
+        tdf["rwa_mit_benefit"] = tdf["rwa_mit_benefit"].map(fmt_bn)
+    tdf["correlation"] = tdf["correlation"].map(lambda x: f"{x:.4f}")
+    tdf["capital_k"]   = tdf["capital_k"].map(lambda x: f"{x*100:.3f}%")
+    show_cols = ["trade_id","pd","lgd_pre","lgd","ead","rwa_pre_mitigant",
+                 "rwa","rwa_mit_benefit","el","mitigant_type","correlation","capital_k"]
+    show_cols = [c for c in show_cols if c in tdf.columns]
+    tdf = tdf[show_cols]
+    rename = {"trade_id":"Trade ID","pd":"PD","lgd_pre":"LGD Gross",
+              "lgd":"LGD* Net","ead":"EAD","rwa_pre_mitigant":"RWA (Pre CRM)",
+              "rwa":"RWA (Post CRM)","rwa_mit_benefit":"CRM Benefit",
+              "el":"EL","mitigant_type":"Channel","correlation":"Corr R","capital_k":"Capital K"}
+    tdf.rename(columns={k:v for k,v in rename.items() if k in tdf.columns}, inplace=True)
     st.dataframe(tdf, width="stretch", hide_index=True)
+
+    sec("ALL PORTFOLIOS — CRM OVERVIEW")
+    bbk_rows = []
+    for p in bbk:
+        rp  = p.get("total_rwa_pre_mit", p["total_rwa"])
+        rb  = p.get("total_mit_benefit", 0.0)
+        red = 100.0*(rp - p["total_rwa"])/rp if rp > 0 else 0.0
+        by_t = p.get("mitigant_by_type", {})
+        bbk_rows.append({
+            "Portfolio":      p["portfolio_id"],
+            "Counterparty":   p["counterparty"][:20],
+            "Exposures":      p["exposure_count"],
+            "EAD":            fmt_bn(p["total_ead"]),
+            "RWA (Pre CRM)":  fmt_bn(rp),
+            "RWA (Post CRM)": fmt_bn(p["total_rwa"]),
+            "CRM Benefit":    fmt_bn(rb),
+            "RWA Reduction":  f"{red:.1f}%",
+            "CRM Coverage":   f"{p.get('mitigant_coverage_pct',0):.0f}%",
+            "Collateral":     fmt_bn(by_t.get("COLLATERAL",0)),
+            "Guarantee":      fmt_bn(by_t.get("GUARANTEE",0)),
+            "CDS":            fmt_bn(by_t.get("CDS",0)),
+        })
+    st.dataframe(pd.DataFrame(bbk_rows), width="stretch", hide_index=True)
 
     sec("PD vs CAPITAL K — VASICEK PROFILE")
     all_t=[]

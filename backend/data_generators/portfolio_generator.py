@@ -360,26 +360,74 @@ def create_banking_book_portfolio(
         lgd       = max(min(lgd, 0.75), 0.10)
         provisions= ead * pd * lgd * rng.uniform(0.5, 1.0)
 
-        # CDS mitigant on ~40% of exposures (req #7)
-        has_cds = rng.random() < 0.40
-        cds_pd  = 0.0
+        # ── Mitigant assignment — diversified across four CRM channels ──────────
+        # Each exposure independently rolls for each mitigant type.
+        # ~40% CDS  | ~30% physical collateral | ~25% guarantee | ~15% deposit netting
+
+        # (A) CDS protection (req #7)
+        has_cds   = rng.random() < 0.40
+        cds_pd    = 0.0
+        cds_cov   = 0.0
         if has_cds:
-            cds_pd = max(pd * rng.uniform(0.1, 0.3), 0.0001)
+            cds_pd  = max(pd * rng.uniform(0.05, 0.25), 0.0001)   # guarantor much better
+            cds_cov = rng.uniform(0.50, 1.00)                      # partial to full
+
+        # (B) Funded collateral — type depends on exposure type
+        col_type  = "NONE"
+        col_value = 0.0
+        if rng.random() < 0.30:
+            if lt["asset"] == "RETAIL_MORT":
+                col_type  = "RESIDENTIAL_RE"
+                col_value = ead * rng.uniform(0.80, 1.20)   # LTV ~80-120%
+            elif lt["asset"] in ("CORP", "BANK"):
+                col_type  = rng.choice(["FINANCIAL", "COMMERCIAL_RE", "RECEIVABLES"])
+                col_value = ead * rng.uniform(0.40, 0.90)
+            elif lt["asset"] == "RETAIL_OTHER":
+                col_type  = "OTHER_PHYSICAL"
+                col_value = ead * rng.uniform(0.30, 0.70)
+            else:
+                col_type  = "FINANCIAL"
+                col_value = ead * rng.uniform(0.30, 0.80)
+
+        # (C) Guarantee from a better-rated entity (banks, sovereigns only)
+        has_guarantee    = False
+        guarantor_pd_val = 0.0
+        gua_lgd          = 0.45
+        gua_coverage     = 0.0
+        if rng.random() < 0.25 and lt["asset"] in ("CORP", "BANK", "SOVEREIGN"):
+            has_guarantee    = True
+            # Guarantor is always better-rated than obligor
+            guarantor_pd_val = max(pd * rng.uniform(0.03, 0.20), 0.00005)
+            gua_lgd          = rng.choice([0.40, 0.45])     # senior unsecured
+            gua_coverage     = rng.uniform(0.40, 0.80)      # partial guarantee
+
+        # (D) Retail deposit netting (CRE32.63) — retail only
+        deposit_offset = 0.0
+        if lt["asset"].startswith("RETAIL") and rng.random() < 0.15:
+            deposit_offset = ead * rng.uniform(0.05, 0.25)  # 5-25% offset from deposit
 
         exp = BankingBookExposure(
-            trade_id     = new_trade_id(portfolio_id, i+1),
-            portfolio_id = portfolio_id,
-            obligor_id   = counterparty["id"],
-            asset_class  = lt["asset"],
-            ead          = ead,
-            pd           = pd,
-            lgd          = lgd,
-            maturity     = maturity,
-            sales_volume = rng.uniform(0, 100e6),
-            has_cds      = has_cds,
-            cds_pd       = cds_pd,
-            cds_lgd      = 0.45,
-            provisions   = provisions,
+            trade_id          = new_trade_id(portfolio_id, i+1),
+            portfolio_id      = portfolio_id,
+            obligor_id        = counterparty["id"],
+            asset_class       = lt["asset"],
+            ead               = ead,
+            pd                = pd,
+            lgd               = lgd,
+            maturity          = maturity,
+            sales_volume      = rng.uniform(0, 100e6),
+            has_cds           = has_cds,
+            cds_pd            = cds_pd,
+            cds_lgd           = 0.45,
+            cds_coverage      = cds_cov,
+            collateral_type   = col_type,
+            collateral_value  = col_value,
+            has_guarantee     = has_guarantee,
+            guarantor_pd      = guarantor_pd_val,
+            guarantor_lgd     = gua_lgd,
+            guarantee_coverage= gua_coverage,
+            deposit_offset    = deposit_offset,
+            provisions        = provisions,
         )
         exposures.append(exp)
 
