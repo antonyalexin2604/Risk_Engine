@@ -65,11 +65,36 @@ class FRTBConfig:
     green_zone_exceptions: int = 4  # 0-4 = green
     amber_zone_max: int = 9         # 5-9 = amber → red >9
 
+@dataclass
+class MarketDataConfig:
+    """Market data provider configuration."""
+    # Primary data source (bloomberg/refinitiv/internal/static_test)
+    primary_source: str = os.getenv("MARKET_DATA_SOURCE", "static_test")
+    # Fallback source if primary unavailable
+    fallback_source: Optional[str] = os.getenv("MARKET_DATA_FALLBACK", None)
+    
+    # Bloomberg settings
+    bloomberg_host: str = os.getenv("BLOOMBERG_HOST", "localhost")
+    bloomberg_port: int = int(os.getenv("BLOOMBERG_PORT", "8194"))
+    
+    # Refinitiv settings
+    refinitiv_app_key: Optional[str] = os.getenv("REFINITIV_APP_KEY", None)
+    refinitiv_username: Optional[str] = os.getenv("REFINITIV_USERNAME", None)
+    
+    # Internal feed settings
+    internal_api_url: Optional[str] = os.getenv("INTERNAL_API_URL", None)
+    internal_api_key: Optional[str] = os.getenv("INTERNAL_API_KEY", None)
+    
+    # Cache settings
+    cache_ttl_seconds: int = int(os.getenv("MARKET_DATA_CACHE_TTL", "300"))
+    use_cache: bool = os.getenv("MARKET_DATA_USE_CACHE", "true").lower() == "true"
+
 # Global instances
 SACCR = SACarCRConfig()
 IMM   = IMMConfig()
 AIRB  = AIRBConfig()
 FRTB  = FRTBConfig()
+MARKET_DATA = MarketDataConfig()
 
 # ─── Misc ─────────────────────────────────────────────────────────────────────
 

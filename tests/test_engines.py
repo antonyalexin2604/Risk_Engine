@@ -210,6 +210,48 @@ class TestSACCREngine:
         assert res_both.ead <= res_long.ead + res_short.ead
 
 
+class TestSACCRHedgingSets:
+    def test_ir_hedging_set_blocks_cross_set_netting(self):
+        """Explicit hedging sets should prevent offset between different sets."""
+        t1 = Trade(
+            trade_id="HS-IR-1",
+            asset_class="IR",
+            instrument_type="IRS",
+            notional=100_000_000,
+            notional_ccy="USD",
+            direction=1,
+            maturity_date=TODAY + timedelta(days=365 * 3),
+            trade_date=TODAY,
+            hedging_set="USD_HS",
+            sub_hedging_set="MEDIUM",
+        )
+        t2 = Trade(
+            trade_id="HS-IR-2",
+            asset_class="IR",
+            instrument_type="IRS",
+            notional=100_000_000,
+            notional_ccy="USD",
+            direction=-1,
+            maturity_date=TODAY + timedelta(days=365 * 3),
+            trade_date=TODAY,
+            hedging_set="EUR_HS",
+            sub_hedging_set="MEDIUM",
+        )
+
+        addon_same_hs = compute_addon_ir(
+            [
+                Trade(**{**t1.__dict__, "hedging_set": "USD_HS"}),
+                Trade(**{**t2.__dict__, "hedging_set": "USD_HS"}),
+            ],
+            has_csa=True,
+            mpor_days=10,
+        )
+        addon_diff_hs = compute_addon_ir([t1, t2], has_csa=True, mpor_days=10)
+
+        assert addon_same_hs == pytest.approx(0.0, abs=1e-9)
+        assert addon_diff_hs > addon_same_hs
+
+
 class TestIMMFallback:
     def test_exotic_fallback(self):
         """Non-IMM instruments should fall back to SA-CCR."""

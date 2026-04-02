@@ -41,8 +41,8 @@ from backend.engines.a_irb import BankingBookExposure
 
 N_DERIVATIVE_PORTFOLIOS = 20    # number of derivative portfolios generated
 N_BANKING_PORTFOLIOS    = 20    # number of banking book portfolios generated
-N_TRADES_MIN_DRV        = 8     # min trades per derivative portfolio
-N_TRADES_MAX_DRV        = 15    # max trades per derivative portfolio
+N_TRADES_MIN_DRV        = 200   # min trades per derivative portfolio
+N_TRADES_MAX_DRV        = 300   # max trades per derivative portfolio
 N_EXP_MIN_BBK           = 8     # min exposures per banking book portfolio
 N_EXP_MAX_BBK           = 15    # max exposures per banking book portfolio
 
@@ -142,34 +142,75 @@ def create_derivative_portfolio(
         mpor_days        = 10,
     )
 
-    # ── Full trade template library (10 types across 5 asset classes) ────────
+    # ── Full trade template library with exotic options ──────────────────────
     templates = [
-        # IR
-        {"asset": "IR",    "type": "IRS",            "notional_range": (10e6, 500e6),  "method": "IMM",    "tenor_yr": 5.0},
-        {"asset": "IR",    "type": "OIS",            "notional_range": (5e6,  100e6),  "method": "IMM",    "tenor_yr": 1.0},
-        {"asset": "IR",    "type": "CRS",            "notional_range": (20e6, 200e6),  "method": "IMM",    "tenor_yr": 7.0},
-        {"asset": "IR",    "type": "IRCap",          "notional_range": (10e6, 150e6),  "method": "SA_CCR", "tenor_yr": 3.0},
-        {"asset": "IR",    "type": "IRFloor",        "notional_range": (10e6, 150e6),  "method": "SA_CCR", "tenor_yr": 3.0},
-        # FX
-        {"asset": "FX",    "type": "FXFwd",          "notional_range": (1e6,  50e6),   "method": "IMM",    "tenor_yr": 1.0},
-        {"asset": "FX",    "type": "FXOption",       "notional_range": (5e6,  30e6),   "method": "SA_CCR", "tenor_yr": 0.5},
-        {"asset": "FX",    "type": "FXSwap",         "notional_range": (10e6, 80e6),   "method": "IMM",    "tenor_yr": 2.0},
-        # Equity
-        {"asset": "EQ",    "type": "EquitySwap",     "notional_range": (2e6,  40e6),   "method": "IMM",    "tenor_yr": 2.0},
-        {"asset": "EQ",    "type": "VarSwap",        "notional_range": (1e6,  10e6),   "method": "SA_CCR", "tenor_yr": 1.0},
-        {"asset": "EQ",    "type": "EquityFwd",      "notional_range": (5e6,  50e6),   "method": "SA_CCR", "tenor_yr": 0.5},
-        # Credit
-        {"asset": "CR",    "type": "CDS_Protection", "notional_range": (5e6,  100e6),  "method": "SA_CCR", "tenor_yr": 5.0},
-        {"asset": "CR",    "type": "TRS",            "notional_range": (10e6, 80e6),   "method": "IMM",    "tenor_yr": 3.0},
-        {"asset": "CR",    "type": "CDS_Index",      "notional_range": (20e6, 200e6),  "method": "SA_CCR", "tenor_yr": 5.0},
-        # Commodity
-        {"asset": "CMDTY", "type": "CommodityFwd",   "notional_range": (1e6,  20e6),   "method": "SA_CCR", "tenor_yr": 1.0},
-        {"asset": "CMDTY", "type": "CommoditySwap",  "notional_range": (5e6,  50e6),   "method": "SA_CCR", "tenor_yr": 2.0},
+        # IR — vanilla
+        {"asset": "IR",    "type": "IRS",            "notional_range": (10e6, 500e6),  "method": "IMM",    "tenor_yr": 5.0,  "is_exotic": False},
+        {"asset": "IR",    "type": "OIS",            "notional_range": (5e6,  100e6),  "method": "IMM",    "tenor_yr": 1.0,  "is_exotic": False},
+        {"asset": "IR",    "type": "CRS",            "notional_range": (20e6, 200e6),  "method": "IMM",    "tenor_yr": 7.0,  "is_exotic": False},
+        # IR — exotic options
+        {"asset": "IR",    "type": "IRCap",          "notional_range": (10e6, 150e6),  "method": "SA_CCR", "tenor_yr": 3.0,  "is_exotic": True},
+        {"asset": "IR",    "type": "IRFloor",        "notional_range": (10e6, 150e6),  "method": "SA_CCR", "tenor_yr": 3.0,  "is_exotic": True},
+        {"asset": "IR",    "type": "Swaption",       "notional_range": (20e6, 200e6),  "method": "SA_CCR", "tenor_yr": 5.0,  "is_exotic": True},
+        {"asset": "IR",    "type": "BermudanSwap",   "notional_range": (50e6, 300e6),  "method": "SA_CCR", "tenor_yr": 10.0, "is_exotic": True},
+        # FX — vanilla
+        {"asset": "FX",    "type": "FXFwd",          "notional_range": (1e6,  50e6),   "method": "IMM",    "tenor_yr": 1.0,  "is_exotic": False},
+        {"asset": "FX",    "type": "FXSwap",         "notional_range": (10e6, 80e6),   "method": "IMM",    "tenor_yr": 2.0,  "is_exotic": False},
+        # FX — exotic options
+        {"asset": "FX",    "type": "FXOption",       "notional_range": (5e6,  30e6),   "method": "SA_CCR", "tenor_yr": 0.5,  "is_exotic": True},
+        {"asset": "FX",    "type": "FXBarrier",      "notional_range": (10e6, 60e6),   "method": "SA_CCR", "tenor_yr": 1.0,  "is_exotic": True},
+        {"asset": "FX",    "type": "FXAsianOption",  "notional_range": (5e6,  40e6),   "method": "SA_CCR", "tenor_yr": 0.75, "is_exotic": True},
+        # Equity — vanilla
+        {"asset": "EQ",    "type": "EquitySwap",     "notional_range": (2e6,  40e6),   "method": "IMM",    "tenor_yr": 2.0,  "is_exotic": False},
+        {"asset": "EQ",    "type": "EquityFwd",      "notional_range": (5e6,  50e6),   "method": "SA_CCR", "tenor_yr": 0.5,  "is_exotic": False},
+        # Equity — exotic options
+        {"asset": "EQ",    "type": "VarSwap",        "notional_range": (1e6,  10e6),   "method": "SA_CCR", "tenor_yr": 1.0,  "is_exotic": True},
+        {"asset": "EQ",    "type": "EquityBarrier",  "notional_range": (3e6,  30e6),   "method": "SA_CCR", "tenor_yr": 1.0,  "is_exotic": True},
+        {"asset": "EQ",    "type": "BasketOption",   "notional_range": (10e6, 80e6),   "method": "SA_CCR", "tenor_yr": 2.0,  "is_exotic": True},
+        # Credit — vanilla
+        {"asset": "CR",    "type": "CDS_Protection", "notional_range": (5e6,  100e6),  "method": "SA_CCR", "tenor_yr": 5.0,  "is_exotic": False},
+        {"asset": "CR",    "type": "TRS",            "notional_range": (10e6, 80e6),   "method": "IMM",    "tenor_yr": 3.0,  "is_exotic": False},
+        {"asset": "CR",    "type": "CDS_Index",      "notional_range": (20e6, 200e6),  "method": "SA_CCR", "tenor_yr": 5.0,  "is_exotic": False},
+        # Credit — exotic
+        {"asset": "CR",    "type": "CDO_Tranche",    "notional_range": (50e6, 500e6),  "method": "SA_CCR", "tenor_yr": 7.0,  "is_exotic": True},
+        # Commodity — vanilla
+        {"asset": "CMDTY", "type": "CommodityFwd",   "notional_range": (1e6,  20e6),   "method": "SA_CCR", "tenor_yr": 1.0,  "is_exotic": False},
+        {"asset": "CMDTY", "type": "CommoditySwap",  "notional_range": (5e6,  50e6),   "method": "SA_CCR", "tenor_yr": 2.0,  "is_exotic": False},
+        # Commodity — exotic
+        {"asset": "CMDTY", "type": "CommodityOption", "notional_range": (3e6,  25e6),   "method": "SA_CCR", "tenor_yr": 1.5,  "is_exotic": True},
+        {"asset": "CMDTY", "type": "SpreadOption",   "notional_range": (10e6, 60e6),   "method": "SA_CCR", "tenor_yr": 2.0,  "is_exotic": True},
     ]
 
     n_trades = max(n_trades, 5)
-    # Sample without replacement up to template count, then pad with repeats
-    selected = rng.sample(templates, min(n_trades, len(templates)))
+
+    # ── Enforce asset class and exotic distribution guarantees ───────────────
+    # Guarantee: at least 1 trade per asset class (IR, FX, EQ, CR, CMDTY)
+    asset_classes = ["IR", "FX", "EQ", "CR", "CMDTY"]
+    required_by_asset = {ac: [t for t in templates if t["asset"] == ac] for ac in asset_classes}
+
+    # Guarantee: at least 10% exotic instruments (or 5 trades, whichever is greater)
+    min_exotics = max(int(n_trades * 0.10), 5)
+    exotic_templates = [t for t in templates if t.get("is_exotic", False)]
+    vanilla_templates = [t for t in templates if not t.get("is_exotic", False)]
+
+    # Pre-seed selection: 1 trade per asset class (prioritize vanilla for baseline)
+    selected = []
+    for ac in asset_classes:
+        ac_pool = required_by_asset[ac]
+        # Try vanilla first, fall back to exotic if no vanilla available
+        vanilla_in_ac = [t for t in ac_pool if not t.get("is_exotic", False)]
+        if vanilla_in_ac:
+            selected.append(rng.choice(vanilla_in_ac))
+        else:
+            selected.append(rng.choice(ac_pool))
+
+    # Add guaranteed exotics
+    current_exotics = sum(1 for t in selected if t.get("is_exotic", False))
+    while current_exotics < min_exotics and len(selected) < n_trades:
+        selected.append(rng.choice(exotic_templates))
+        current_exotics += 1
+
+    # Fill remainder randomly from all templates
     while len(selected) < n_trades:
         selected.append(rng.choice(templates))
 

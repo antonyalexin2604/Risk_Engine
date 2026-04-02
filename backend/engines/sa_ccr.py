@@ -40,6 +40,8 @@ class Trade:
     current_mtm:       float = 0.0
     fixed_rate:        Optional[float] = None
     reference_period:  Optional[float] = None   # for IR: tenor in years
+    hedging_set:       Optional[str] = None
+    sub_hedging_set:   Optional[str] = None
     saccr_method:      str = "SA_CCR"            # 'SA_CCR' | 'IMM' | 'FALLBACK'
     fallback_trace:    Optional[str] = None
 
@@ -48,10 +50,10 @@ class NettingSet:
     netting_id:        str
     counterparty_id:   str
     trades:            List[Trade]  = field(default_factory=list)
-    initial_margin:    float = 0.0  # IM received (positive = received)
+    initial_margin:    float = 500_000.0  # IM received (positive = received)
     variation_margin:  float = 0.0  # VM received
     threshold:         float = 0.0
-    mta:               float = 500_000
+    mta:               float = 200_000
     has_csa:           bool = True
     mpor_days:         int = 10
 
@@ -159,76 +161,166 @@ def _effective_notional(trade: Trade, has_csa: bool, mpor_days: int) -> float:
     else:
         d = _adjusted_notional_other(trade)
     MF = maturity_factor(trade, has_csa, mpor_days)
-    delta = trade.supervisory_delta if hasattr(trade, 'supervisory_delta') else 1.0
+    delta = getattr(trade, 'supervisory_delta', 1.0)
     return delta * d * MF
+
+def _remaining_maturity_years(trade: Trade, as_of: Optional[date] = None) -> float:
+    as_of = as_of or date.today()
+    return max((trade.maturity_date - as_of).days / 365.0, 0.0)
+
+def _resolve_hedging_set(trade: Trade) -> str:
+    """
+    Resolve hedging set key.
+    If explicit `hedging_set` is provided on the trade, it takes precedence.
+    """
+    if trade.hedging_set:
+        return trade.hedging_set
+
+    if trade.asset_class == "IR":
+        return trade.notional_ccy
+    if trade.asset_class == "FX":
+        return trade.notional_ccy
+    if trade.asset_class in ("CR", "EQ"):
+        return getattr(trade, 'reference_entity', trade.trade_id)
+    if trade.asset_class == "CMDTY":
+        return getattr(trade, 'commodity_type', 'CMDTY_OTHER')
+    return trade.asset_class
+
+def _resolve_sub_hedging_set(trade: Trade, as_of: Optional[date] = None) -> str:
+    """
+    Resolve sub-hedging set key.
+    If explicit `sub_hedging_set` is provided on the trade, it takes precedence.
+
+    For IR, default buckets are by residual maturity:
+      - SHORT: <= 1y
+      - MEDIUM: >1y and <=5y
+      - LONG: >5y
+    """
+    if trade.sub_hedging_set:
+        return trade.sub_hedging_set
+
+    if trade.asset_class == "IR":
+        mat = _remaining_maturity_years(trade, as_of=as_of)
+        if mat <= 1.0:
+            return "SHORT"
+        if mat <= 5.0:
+            return "MEDIUM"
+        return "LONG"
+
+    return "ALL"
 
 def compute_addon_ir(trades: List[Trade], has_csa: bool, mpor_days: int) -> float:
     """
-    CRE52.39–43: IR add-on via hedging set (currency) aggregation.
-    AddOn_IR = sum over currencies of |EffNot_currency|
+    CRE52.39–43: IR add-on via hedging set and sub-hedging set aggregation.
+
+    Hedging set defaults to currency unless explicitly provided on the trade.
+    Sub-hedging set defaults to residual maturity buckets (SHORT/MEDIUM/LONG)
+    unless explicitly provided on the trade.
     """
-    currency_buckets: Dict[str, float] = {}
+    hedging_buckets: Dict[str, Dict[str, float]] = {}
     for t in trades:
         if t.asset_class != "IR":
             continue
         en = _effective_notional(t, has_csa, mpor_days) * t.direction * SF["IR"]
-        currency_buckets[t.notional_ccy] = currency_buckets.get(t.notional_ccy, 0) + en
-    return sum(abs(v) for v in currency_buckets.values())
+        hs = _resolve_hedging_set(t)
+        shs = _resolve_sub_hedging_set(t)
+        if hs not in hedging_buckets:
+            hedging_buckets[hs] = {}
+        hedging_buckets[hs][shs] = hedging_buckets[hs].get(shs, 0.0) + en
+
+    total_addon = 0.0
+    for _, sub_bucket in hedging_buckets.items():
+        d1 = sub_bucket.get("SHORT", 0.0)
+        d2 = sub_bucket.get("MEDIUM", 0.0)
+        d3 = sub_bucket.get("LONG", 0.0)
+
+        # CRE52.43 simplified cross-bucket correlation for IR maturity buckets
+        std_component = d1 * d1 + d2 * d2 + d3 * d3 + 1.4 * d1 * d2 + 1.4 * d2 * d3 + 0.6 * d1 * d3
+        addon_hs = math.sqrt(max(std_component, 0.0))
+
+        # If custom sub-hedging labels are provided, conservatively add them in absolute terms.
+        for key, value in sub_bucket.items():
+            if key not in {"SHORT", "MEDIUM", "LONG"}:
+                addon_hs += abs(value)
+
+        total_addon += addon_hs
+
+    return total_addon
 
 def compute_addon_fx(trades: List[Trade], has_csa: bool, mpor_days: int) -> float:
-    """CRE52.44–46: FX add-on per currency pair."""
-    pair_buckets: Dict[str, float] = {}
+    """CRE52.44–46: FX add-on by hedging set and optional sub-hedging set."""
+    pair_buckets: Dict[str, Dict[str, float]] = {}
     for t in trades:
         if t.asset_class != "FX":
             continue
         en = _effective_notional(t, has_csa, mpor_days) * t.direction * SF["FX"]
-        pair_buckets[t.notional_ccy] = pair_buckets.get(t.notional_ccy, 0) + en
-    return sum(abs(v) for v in pair_buckets.values())
+        hs = _resolve_hedging_set(t)
+        shs = _resolve_sub_hedging_set(t)
+        if hs not in pair_buckets:
+            pair_buckets[hs] = {}
+        pair_buckets[hs][shs] = pair_buckets[hs].get(shs, 0.0) + en
+
+    return sum(abs(sum(sub.values())) for sub in pair_buckets.values())
 
 def compute_addon_credit(trades: List[Trade], has_csa: bool, mpor_days: int) -> float:
-    """CRE52.47–53: Credit add-on with entity-level aggregation."""
-    entity_buckets: Dict[str, float] = {}
+    """CRE52.47–53: Credit add-on with hedging set and sub-hedging support."""
+    entity_buckets: Dict[str, Dict[str, float]] = {}
     for t in trades:
         if t.asset_class != "CR":
             continue
         sf_key = "CR_IG"  # simplified; real implementation grades CDS
         en = _effective_notional(t, has_csa, mpor_days) * t.direction * SF[sf_key]
-        ref = getattr(t, 'reference_entity', t.trade_id)
-        entity_buckets[ref] = entity_buckets.get(ref, 0) + en
+        hs = _resolve_hedging_set(t)
+        shs = _resolve_sub_hedging_set(t)
+        if hs not in entity_buckets:
+            entity_buckets[hs] = {}
+        entity_buckets[hs][shs] = entity_buckets[hs].get(shs, 0.0) + en
+
+    entity_en = {hs: sum(sub.values()) for hs, sub in entity_buckets.items()}
     # systemic correlation rho=0.5 (CRE52.53)
     rho = 0.50
-    EN_sum = sum(entity_buckets.values())
-    ind_var = sum(v**2 for v in entity_buckets.values())
+    EN_sum = sum(entity_en.values())
+    ind_var = sum(v**2 for v in entity_en.values())
     addon = math.sqrt(rho**2 * EN_sum**2 + (1-rho**2) * ind_var)
     return addon
 
 def compute_addon_equity(trades: List[Trade], has_csa: bool, mpor_days: int) -> float:
-    """CRE52.54–60: Equity add-on."""
-    entity_buckets: Dict[str, float] = {}
+    """CRE52.54–60: Equity add-on with hedging set and sub-hedging support."""
+    entity_buckets: Dict[str, Dict[str, float]] = {}
     for t in trades:
         if t.asset_class != "EQ":
             continue
         en = _effective_notional(t, has_csa, mpor_days) * t.direction * SF["EQ"]
-        ref = getattr(t, 'reference_entity', t.trade_id)
-        entity_buckets[ref] = entity_buckets.get(ref, 0) + en
+        hs = _resolve_hedging_set(t)
+        shs = _resolve_sub_hedging_set(t)
+        if hs not in entity_buckets:
+            entity_buckets[hs] = {}
+        entity_buckets[hs][shs] = entity_buckets[hs].get(shs, 0.0) + en
+
+    entity_en = {hs: sum(sub.values()) for hs, sub in entity_buckets.items()}
     rho = 0.50
-    EN_sum = sum(entity_buckets.values())
-    ind_var = sum(v**2 for v in entity_buckets.values())
+    EN_sum = sum(entity_en.values())
+    ind_var = sum(v**2 for v in entity_en.values())
     return math.sqrt(rho**2 * EN_sum**2 + (1-rho**2) * ind_var)
 
 def compute_addon_commodity(trades: List[Trade], has_csa: bool, mpor_days: int) -> float:
-    """CRE52.61–67: Commodity add-on by sub-type."""
-    subtype_buckets: Dict[str, float] = {}
+    """CRE52.61–67: Commodity add-on by hedging set and sub-hedging set."""
+    subtype_buckets: Dict[str, Dict[str, float]] = {}
     for t in trades:
         if t.asset_class != "CMDTY":
             continue
-        sub = getattr(t, 'commodity_type', 'CMDTY_OTHER')
-        sf_val = SF.get(sub, SF["CMDTY_OTHER"])
+        hs = _resolve_hedging_set(t)
+        shs = _resolve_sub_hedging_set(t)
+        sf_val = SF.get(hs, SF["CMDTY_OTHER"])
         en = _effective_notional(t, has_csa, mpor_days) * t.direction * sf_val
-        subtype_buckets[sub] = subtype_buckets.get(sub, 0) + en
+        if hs not in subtype_buckets:
+            subtype_buckets[hs] = {}
+        subtype_buckets[hs][shs] = subtype_buckets[hs].get(shs, 0.0) + en
+
+    hs_en = {hs: sum(sub.values()) for hs, sub in subtype_buckets.items()}
     rho = 0.40
-    EN_sum = sum(subtype_buckets.values())
-    ind_var = sum(v**2 for v in subtype_buckets.values())
+    EN_sum = sum(hs_en.values())
+    ind_var = sum(v**2 for v in hs_en.values())
     return math.sqrt(rho**2 * EN_sum**2 + (1-rho**2) * ind_var)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -284,7 +376,7 @@ class SACCREngine:
         self.alpha = SACCR.alpha
         logger.info("SA-CCR Engine initialised (CRE52, α=%.1f)", self.alpha)
 
-    def compute_ead(self, ns: NettingSet, run_date: date = None) -> SAcCRResult:
+    def compute_ead(self, ns: NettingSet, run_date: Optional[date] = None) -> SAcCRResult:
         run_date = run_date or date.today()
 
         # Partition trades: SA-CCR vs IMM

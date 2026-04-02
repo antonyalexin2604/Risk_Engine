@@ -38,8 +38,159 @@ from typing import (
 )
 
 import numpy as np
+from enum import Enum as StdEnum
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Market Regime & Real-Time Data
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MarketRegime(StdEnum):
+    """Market state affecting risk weights and correlations."""
+    NORMAL = "normal"
+    STRESSED = "stressed"
+    CRISIS = "crisis"
+
+@dataclass
+class MarketConditions:
+    """
+    Real-time market data for dynamic FRTB parameter adjustment.
+    Connect to Bloomberg/Reuters/internal feeds in production.
+    """
+    date: date
+    vix_level: float = 15.0              # VIX index (normal ~15-20, crisis >40)
+    equity_vol_index: float = 20.0       # Equity realized vol (annualized %)
+    credit_spread_ig: float = 100.0      # IG credit spread (bp)
+    credit_spread_hy: float = 400.0      # HY credit spread (bp)
+    fx_vol_index: float = 8.0            # FX vol index (e.g., JPM FX VIX)
+    cmdty_vol_index: float = 25.0        # Commodity volatility
+    ir_vol_swaption: float = 50.0        # Swaption implied vol (bp)
+    
+    def stress_level(self) -> float:
+        """Composite stress index [0, 1]: 0=normal, 1=extreme crisis."""
+        vix_norm = min(self.vix_level / 80.0, 1.0)
+        spread_norm = min((self.credit_spread_hy - 300) / 1200.0, 1.0)
+        eq_vol_norm = min((self.equity_vol_index - 15) / 50.0, 1.0)
+        stress = 0.40*vix_norm + 0.35*spread_norm + 0.25*eq_vol_norm
+        return min(max(stress, 0.0), 1.0)
+    
+    def regime(self) -> MarketRegime:
+        """Classify market regime based on stress level."""
+        s = self.stress_level()
+        if s < 0.30:
+            return MarketRegime.NORMAL
+        elif s < 0.65:
+            return MarketRegime.STRESSED
+        else:
+            return MarketRegime.CRISIS
+
+class MarketDataFeed:
+    """
+    Real-time market data integration interface.
+    Production: connect to Bloomberg, Reuters, or internal systems.
+    """
+    def __init__(self):
+        self._cache: Optional[MarketConditions] = None
+        self._cache_timestamp: Optional[date] = None
+    
+    def get_current_conditions(self, force_refresh: bool = False) -> MarketConditions:
+        """Fetch current market conditions (cached daily)."""
+        today = date.today()
+        if not force_refresh and self._cache and self._cache_timestamp == today:
+            return self._cache
+        
+        # TODO: Production integration example:
+        # vix = bloomberg_api.get('VIX Index')
+        # hy_spread = bloomberg_api.get('CDX HY Spread')
+        # fx_vol = reuters_api.get('JPM FX VIX')
+        
+        conditions = MarketConditions(
+            date=today,
+            vix_level=15.0,  # Default/demo values
+            equity_vol_index=20.0,
+            credit_spread_ig=100.0,
+            credit_spread_hy=400.0,
+            fx_vol_index=8.0,
+            cmdty_vol_index=25.0,
+            ir_vol_swaption=50.0,
+        )
+        
+        self._cache = conditions
+        self._cache_timestamp = today
+        
+        logger.info(
+            "Market conditions: VIX=%.1f, HY=%dbp, stress=%.2f (%s)",
+            conditions.vix_level, conditions.credit_spread_hy,
+            conditions.stress_level(), conditions.regime().value
+        )
+        return conditions
+    
+    def update_from_dict(self, data: Dict[str, float]) -> MarketConditions:
+        """Manually update conditions from dict (for testing/custom feeds)."""
+        conditions = MarketConditions(
+            date=date.today(),
+            vix_level=data.get('vix', 15.0),
+            equity_vol_index=data.get('eq_vol', 20.0),
+            credit_spread_ig=data.get('ig_spread', 100.0),
+            credit_spread_hy=data.get('hy_spread', 400.0),
+            fx_vol_index=data.get('fx_vol', 8.0),
+            cmdty_vol_index=data.get('cmdty_vol', 25.0),
+            ir_vol_swaption=data.get('ir_vol', 50.0),
+        )
+        self._cache = conditions
+        self._cache_timestamp = date.today()
+        return conditions
+
+class DynamicParameterAdjustment:
+    """
+    Adjusts FRTB risk weights/correlations based on real-time market volatility.
+    Implements counter-cyclical buffer (higher vol → higher risk weights).
+    """
+    def __init__(self, base_config: 'FRTBConfig'):
+        self.base_config = base_config
+    
+    def adjust_risk_weights(self, market: MarketConditions, risk_class: str) -> Sequence[float]:
+        """Scale risk weights based on realized volatility vs normal levels."""
+        base_rw = self.base_config.delta_rw.get(risk_class, [0.15])
+        stress = market.stress_level()
+        
+        # Volatility-based scaling per risk class
+        if risk_class == "GIRR":
+            scaling = 0.80 + 0.40 * (market.ir_vol_swaption / 50.0)
+        elif risk_class in ("CSR_NS", "CSR_SEC"):
+            scaling = 0.80 + 0.60 * (market.credit_spread_hy / 400.0)
+        elif risk_class.startswith("EQ"):
+            scaling = 0.75 + 0.75 * (market.equity_vol_index / 20.0)
+        elif risk_class == "FX":
+            scaling = 0.85 + 0.50 * (market.fx_vol_index / 8.0)
+        elif risk_class == "CMDTY":
+            scaling = 0.80 + 0.80 * (market.cmdty_vol_index / 25.0)
+        else:
+            scaling = 1.0
+        
+        # Crisis amplification
+        if stress > 0.65:
+            scaling *= (1.0 + 0.5 * (stress - 0.65) / 0.35)
+        
+        scaling = max(0.5, min(scaling, 3.0))
+        return [rw * scaling for rw in base_rw]
+    
+    def adjust_correlation(self, market: MarketConditions, risk_class: str, 
+                          corr_type: str = "intra") -> float:
+        """Crisis → higher correlations (diversification breakdown)."""
+        stress = market.stress_level()
+        base = (self.base_config.intra_corr if corr_type == "intra" 
+                else self.base_config.inter_corr).get(risk_class, 0.50)
+        
+        if stress < 0.30:
+            multiplier = 1.0
+        elif stress < 0.65:
+            multiplier = 1.0 + 0.20 * (stress - 0.30) / 0.35
+        else:
+            multiplier = 1.20 + 0.30 * (stress - 0.65) / 0.35
+        
+        return min(base * multiplier, 0.99)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Custom Exceptions
@@ -95,10 +246,15 @@ class CorrelationModel:
 
 @dataclass
 class FRTBConfig:
-    """Centralized FRTB configuration per MAR21-33."""
+    """Centralized FRTB configuration per MAR21-33 with real-time market support."""
     risk_classes: List[str] = field(default_factory=lambda: [
         "GIRR", "CSR_NS", "CSR_SEC", "EQ", "CMDTY", "FX"
     ])
+    
+    # Real-time market integration (NEW)
+    use_market_conditions: bool = False  # Enable dynamic parameter adjustment
+    market_data_feed: Optional[MarketDataFeed] = None
+    dynamic_adjuster: Optional[DynamicParameterAdjustment] = None
 
     delta_rw: Dict[str, Sequence[float]] = field(default_factory=lambda: {
         "GIRR": [0.017, 0.017, 0.016, 0.013, 0.012, 0.011, 0.011,
@@ -145,6 +301,14 @@ class FRTBConfig:
                 intra_corr=self.intra_corr,
                 inter_corr=self.inter_corr,
             )
+        
+        # Initialize real-time market components if enabled
+        if self.use_market_conditions:
+            if self.market_data_feed is None:
+                self.market_data_feed = MarketDataFeed()
+            if self.dynamic_adjuster is None:
+                self.dynamic_adjuster = DynamicParameterAdjustment(self)
+            logger.info("FRTB real-time market conditions ENABLED")
 
     def validate(self) -> None:
         """Validate configuration consistency and regulatory bounds."""
@@ -369,20 +533,23 @@ class SBMCalculator:
             self._inter_cache[key] = self.config.correlation_model.inter(risk_class, m)
         return self._inter_cache[key]
 
-    def _risk_weight_for(self, s: Sensitivity) -> float:
+    def _risk_weight_for(self, s: Sensitivity, market: Optional[MarketConditions] = None) -> float:
         """
-        Deterministic RW lookup:
-          1. Try explicit rw_index_map[(risk_class, risk_factor)]
-          2. Fallback to sequential index based on risk_factor name
+        RW lookup with optional real-time market adjustment.
+        If market conditions enabled: scales RW based on current volatility.
         """
-        rw_map = self.config.delta_rw.get(
-            s.risk_class,
-            self.config.delta_rw.get(s.risk_class + "_LARGE", [0.15]),
-        )
+        # Get base or dynamically adjusted risk weights
+        if self.config.use_market_conditions and market and self.config.dynamic_adjuster:
+            rw_map = self.config.dynamic_adjuster.adjust_risk_weights(market, s.risk_class)
+        else:
+            rw_map = self.config.delta_rw.get(
+                s.risk_class,
+                self.config.delta_rw.get(s.risk_class + "_LARGE", [0.15]),
+            )
+        
         if (s.risk_class, s.risk_factor) in self.config.rw_index_map:
             idx = self.config.rw_index_map[(s.risk_class, s.risk_factor)]
         else:
-            # deterministic but simple: hash of risk_factor string
             idx = abs(hash(s.risk_factor)) % len(rw_map)
         return rw_map[idx]
 
@@ -393,9 +560,10 @@ class SBMCalculator:
         sensitivities: Sequence[Sensitivity],
         risk_class: str,
         breakdown_by_bucket: Optional[Dict[str, float]] = None,
+        market: Optional[MarketConditions] = None,
     ) -> float:
         """
-        1. WS_k = RW_k × s_k
+        1. WS_k = RW_k × s_k (RW adjusted for market if enabled)
         2. K_b = sqrt(Σ_k WS_k² + Σ_{k≠l} ρ_{kl} WS_k WS_l)   [intra-bucket]
         3. Δ   = sqrt(Σ_b K_b² + Σ_{b≠c} γ_{bc} K_b K_c)      [inter-bucket]
         """
@@ -407,7 +575,7 @@ class SBMCalculator:
             # bucket -> list of WS
             buckets: Dict[str, List[float]] = {}
             for s in senses:
-                rw = self._risk_weight_for(s)
+                rw = self._risk_weight_for(s, market=market)
                 ws = rw * s.delta
                 buckets.setdefault(s.bucket, []).append(ws)
 
@@ -478,11 +646,14 @@ class SBMCalculator:
     def total_sbm(
         self,
         sensitivities: Sequence[Sensitivity],
+        market: Optional[MarketConditions] = None,
     ) -> Tuple[float, float, float, float, Dict[str, float], Dict[str, float]]:
         """
         Returns:
             delta_total, vega_total, curv_total, sbm_total,
             sbm_by_risk_class, sbm_by_bucket
+        
+        market: Optional real-time conditions for dynamic RW adjustment
         """
         delta_charges: Dict[str, float] = {}
         vega_charges: Dict[str, float] = {}
@@ -491,7 +662,7 @@ class SBMCalculator:
 
         for rc in self.config.risk_classes:
             rc_bucket_breakdown: Dict[str, float] = {}
-            d = self.delta_charge(sensitivities, rc, breakdown_by_bucket=rc_bucket_breakdown)
+            d = self.delta_charge(sensitivities, rc, breakdown_by_bucket=rc_bucket_breakdown, market=market)
             v = self.vega_charge(sensitivities, rc)
             c = self.curvature_charge(sensitivities, rc)
             delta_charges[rc] = d
@@ -666,12 +837,31 @@ class FRTBEngine:
         avg_notional: float = 1_000_000,
         run_date: Optional[date] = None,
         es_method: str = "historical",
+        market_conditions: Optional[MarketConditions] = None,
     ) -> FRTBResult:
         """
-        Compute complete FRTB capital charge.
+        Compute complete FRTB capital charge with optional real-time market overlay.
+        
+        Args:
+            market_conditions: Optional real-time market data.
+                If None and use_market_conditions=True, fetches current conditions.
         """
         try:
             run_date = run_date or date.today()
+
+            # Fetch real-time market conditions if enabled
+            market: Optional[MarketConditions] = None
+            if self.config.use_market_conditions:
+                if market_conditions is not None:
+                    market = market_conditions
+                elif self.config.market_data_feed is not None:
+                    market = self.config.market_data_feed.get_current_conditions()
+                
+                if market:
+                    logger.info(
+                        "FRTB with real-time conditions: regime=%s, stress=%.2f, VIX=%.1f",
+                        market.regime().value, market.stress_level(), market.vix_level
+                    )
 
             # Validate & aggregate
             validate_sensitivities(sensitivities, self.config)
@@ -680,8 +870,8 @@ class FRTBEngine:
             if pnl_series is not None:
                 validate_pnl_series(pnl_series)
 
-            # ── SBM ──
-            delta_t, vega_t, curv_t, sbm_t, sbm_by_rc, sbm_by_bucket = self.sbm.total_sbm(agg_sens)
+            # ── SBM (with market overlay if enabled) ──
+            delta_t, vega_t, curv_t, sbm_t, sbm_by_rc, sbm_by_bucket = self.sbm.total_sbm(agg_sens, market=market)
 
             # ── IMA / ES ──
             if pnl_series is not None and len(pnl_series) > 0:

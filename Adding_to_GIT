@@ -1,0 +1,6 @@
+Adding_to_GIT:
+
+cd /Users/aaron/Documents/Project/Prometheus
+git add .
+git commit -m "Your commit message"
+git push
