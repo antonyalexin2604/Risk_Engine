@@ -1312,11 +1312,91 @@ class IMMEngine:
         
         return results
 
+
+    def compute_csa_ead_regulatory(
+        self,
+        profile: "ExposureProfile",
+        netting_set,
+    ) -> tuple:
+        """
+        Regulatory CSA-adjusted IMM EAD per CRE53.22-53.23.
+
+        Combines two Basel-mandated benefit channels:
+
+        (1) RC benefit — Variation Margin received reduces current exposure.
+            The net current exposure after VM = max(V - VM - IM, TH + MTA - NICA, 0)
+            which mirrors the SA-CCR RC formula (CRE52.18).
+
+        (2) MPOR benefit — Future exposure window is MPOR days not full maturity.
+            EEPE_mpor = EEPE_gross × √(MPOR / 250)
+            This is the regulatory approximation for uncollateralised models
+            per CRE53.22 (model does not explicitly simulate margining).
+
+        Combined:
+            EAD_csa = α × (RC_csa + EEPE_mpor)
+
+        Returns:
+            (ead_csa, csa_reduction_pct, rc_csa, eepe_mpor, mpor_scale)
+        """
+        import math as _math
+
+        # ── Extract CSA terms from netting set ─────────────────────────────
+        V    = sum(t.current_mtm for t in netting_set.trades) if netting_set.trades else profile.epe
+        VM   = getattr(netting_set, "variation_margin", 0.0)
+        IM   = getattr(netting_set, "initial_margin",   0.0)
+        TH   = getattr(netting_set, "threshold",        0.0)
+        MTA  = getattr(netting_set, "mta",              0.0)
+        MPOR = getattr(netting_set, "mpor_days",       10)
+        NICA = IM   # net independent collateral amount (IM received)
+
+        # ── (1) RC benefit — current exposure after VM ──────────────────────
+        # CRE52.18: RC = max(V - C, TH + MTA - NICA, 0)
+        # where C = VM + IM (total collateral received)
+        C      = VM + IM
+        rc_csa = max(V - C, TH + MTA - NICA, 0.0)
+
+        # ── (2) MPOR benefit — future exposure scaled to margin window ───────
+        # Per CRE53.22 (uncollateralised model approximation):
+        # EEPE_margined ≈ EEPE_gross × √(MPOR / 250)
+        # This captures that a daily-VM portfolio's future risk window
+        # is just the MPOR period, not the full trade maturity.
+        mpor_scale = _math.sqrt(MPOR / 250.0)
+        eepe_mpor  = profile.eepe * mpor_scale
+
+        # ── Combined CSA EAD ──────────────────────────────────────────────────
+        ead_csa = self.alpha * (rc_csa + eepe_mpor)
+        ead_csa = max(ead_csa, 0.0)
+
+        # Percentage reduction vs gross EAD (profile.ead = α × EEPE_gross)
+        reduction_pct = (
+            100.0 * (profile.ead - ead_csa) / profile.ead
+            if profile.ead > 0 else 0.0
+        )
+
+        logger.info(
+            "CSA Regulatory EAD [%s]: "
+            "V=%.0f VM=%.0f IM=%.0f TH=%.0f MTA=%.0f | "
+            "RC_csa=%.0f  EEPE_gross=%.0f  MPOR_scale=%.3f  EEPE_mpor=%.0f | "
+            "EAD_gross=%.0f → EAD_csa=%.0f  (−%.1f%%)",
+            getattr(netting_set, "netting_id", "?"),
+            V, VM, IM, TH, MTA,
+            rc_csa, profile.eepe, mpor_scale, eepe_mpor,
+            profile.ead, ead_csa, reduction_pct,
+        )
+
+        return ead_csa, reduction_pct, rc_csa, eepe_mpor, mpor_scale
+
     def run_for_portfolio(
         self, trades: List[Trade], run_date: Optional[date] = None,
         runtime_cap_sec: float = 120.0, include_greeks: bool = False,
-        include_incremental_risk: bool = False
+        include_incremental_risk: bool = False,
+        netting_set=None,
     ) -> Dict:
+        """
+        netting_set: optional NettingSet — when provided, CSA-adjusted EAD
+                     is computed via compute_csa_ead_regulatory() and returned
+                     as 'ead_imm_csa' alongside the gross 'ead_imm'.
+        """
         """
         Convenience wrapper — returns dict for DB insertion.
         include_greeks: If True, compute Greeks (slower, adds ~20-30% runtime).
@@ -1369,6 +1449,27 @@ class IMMEngine:
                 "contribution_by_asset_class": incremental_risk.get("contribution_by_asset_class", []),
             })
         
+        # ── CSA-adjusted EAD (regulatory, CRE53.22) ─────────────────────────────
+        if netting_set is not None and getattr(netting_set, "has_csa", False):
+            ead_csa, csa_red, rc_csa, eepe_mpor, mpor_scale = (
+                self.compute_csa_ead_regulatory(profile, netting_set)
+            )
+            result["ead_imm_csa"]       = ead_csa
+            result["csa_reduction_pct"] = round(csa_red, 2)
+            result["rc_csa"]            = rc_csa
+            result["eepe_mpor"]         = eepe_mpor
+            result["mpor_scale"]        = round(mpor_scale, 4)
+            result["vm_received"]       = getattr(netting_set, "variation_margin", 0.0)
+            result["im_posted"]         = getattr(netting_set, "initial_margin",   0.0)
+        else:
+            result["ead_imm_csa"]       = result["ead_imm"]   # no CSA → same as gross
+            result["csa_reduction_pct"] = 0.0
+            result["rc_csa"]            = 0.0
+            result["eepe_mpor"]         = result.get("eepe", 0.0)
+            result["mpor_scale"]        = 1.0
+            result["vm_received"]       = 0.0
+            result["im_posted"]         = 0.0
+
         elapsed = time.perf_counter() - start
 
         if elapsed > runtime_cap_sec:

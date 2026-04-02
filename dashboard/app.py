@@ -427,11 +427,15 @@ elif page == "Derivative Portfolios":
     pid  = st.selectbox("Portfolio",[p["portfolio_id"] for p in drv],label_visibility="collapsed")
     port = next(p for p in drv if p["portfolio_id"]==pid)
     imm  = port.get("imm") or {}
-    c1,c2,c3,c4 = st.columns(4)
-    kpi(c1,"Gross Notional",fmt_bn(port["gross_notional"]),"Total notional",  "Pre-netting", "t-stone")
-    kpi(c2,"SA-CCR EAD",    fmt_bn(port["saccr"]["ead"]), "Exposure at Default","CRE52 α=1.4","t-blue")
-    kpi(c3,"IMM EAD",       fmt_bn(imm.get("ead_imm",0)), "Internal Models EAD","CRE53 floor","t-stone")
-    kpi(c4,"CCR RWA",       fmt_bn(port["rwa_ccr"]),      "Credit RWA (CCR)",  "CRE51.13",   "t-blue")
+    c1,c2,c3,c4,c5 = st.columns(5)
+    kpi(c1,"Gross Notional",  fmt_bn(port["gross_notional"]),          "Total notional",       "Pre-netting",   "t-stone")
+    kpi(c2,"SA-CCR EAD",      fmt_bn(port["saccr"]["ead"]),            "Exposure at Default",  "CRE52 α=1.4",   "t-blue")
+    ead_gross = imm.get("ead_imm", 0)
+    ead_csa   = imm.get("ead_imm_csa", ead_gross)
+    csa_red   = imm.get("csa_reduction_pct", 0)
+    kpi(c3,"IMM EAD (Gross)", fmt_bn(ead_gross),                       "Before CSA benefit",   "CRE53 uncoll.", "t-stone")
+    kpi(c4,"IMM EAD (CSA)",   fmt_bn(ead_csa),                         "After CSA: VM+IM+MPOR","CRE53.22",      "t-ok" if csa_red>10 else "t-stone")
+    kpi(c5,"CCR RWA",         fmt_bn(port["rwa_ccr"]),                 "Credit RWA (CCR)",     "CRE51.13",      "t-blue")
 
     sec("SA-CCR ADD-ON BY ASSET CLASS")
     addons={"Interest Rate":port["saccr"]["addon_ir"],"FX":port["saccr"]["addon_fx"],
@@ -445,14 +449,33 @@ elif page == "Derivative Portfolios":
     fig_add.update_layout(**PLOT(280,10), yaxis_title="USD Millions")
     st.plotly_chart(fig_add)
 
+    # ── CSA Benefit Summary ──────────────────────────────────────────────────
+    if imm:
+        vm_r  = imm.get("vm_received",  0)
+        im_p  = imm.get("im_posted",    0)
+        rc_c  = imm.get("rc_csa",       0)
+        mpor_s= imm.get("mpor_scale",   1.0)
+        sec("CSA BENEFIT DECOMPOSITION — CRE53.22")
+        cb1,cb2,cb3,cb4 = st.columns(4)
+        kpi(cb1,"VM Received",    fmt_bn(vm_r),          "Variation Margin",      "Daily call",       "t-ok")
+        kpi(cb2,"IM Posted",      fmt_bn(im_p),          "Initial Margin (SIMM)", "Segregated",        "t-ok")
+        kpi(cb3,"RC after CSA",   fmt_bn(rc_c),          "Net current exposure",  "CRE52.18 formula",  "t-blue" if rc_c>0 else "t-ok")
+        kpi(cb4,"EAD Reduction",  f"{csa_red:.1f}%",     "Gross→CSA benefit",     "MPOR scale: {:.3f}".format(mpor_s), "t-ok" if csa_red>20 else "t-warn")
+        st.markdown("")
+
     sec("ALL DERIVATIVE PORTFOLIOS")
     rows=[]
     for p in drv:
         imm_r = p.get("imm") or {}
+        imm_gross = imm_r.get("ead_imm", 0)
+        imm_csa   = imm_r.get("ead_imm_csa", imm_gross)
+        csa_pct   = imm_r.get("csa_reduction_pct", 0)
         rows.append({"Portfolio":p["portfolio_id"],"Counterparty":p["counterparty"],
                      "Trades":p["trade_count"],"Notional":fmt_bn(p["gross_notional"]),
                      "SA-CCR EAD":fmt_bn(p["saccr"]["ead"]),
-                     "IMM EAD":fmt_bn(imm_r.get("ead_imm",0)),
+                     "IMM EAD (Gross)":fmt_bn(imm_gross),
+                     "IMM EAD (CSA)":fmt_bn(imm_csa),
+                     "CSA Benefit":f"{csa_pct:.1f}%",
                      "CCR RWA":fmt_bn(p["rwa_ccr"]),"Market RWA":fmt_bn(p["rwa_market"])})
     st.dataframe(pd.DataFrame(rows),width="stretch",hide_index=True)
 

@@ -83,10 +83,11 @@ class PrometheusRunner:
             imm_trades = [t for t in trades if t.saccr_method == "IMM"]
             imm_res    = None
             if imm_trades:
-                imm_res = self.imm.run_for_portfolio(imm_trades, run_date)
+                imm_res = self.imm.run_for_portfolio(imm_trades, run_date, netting_set=netting)
 
             ead_ccr = saccr_res.ead
-            if imm_res and imm_res["ead_imm"] < saccr_res.ead * 0.5:
+            # Use CSA-adjusted EAD for floor check (CRE53.5)
+            if imm_res and imm_res["ead_imm_csa"] < saccr_res.ead * 0.5:
                 logger.warning("Portfolio %s: IMM below SA-CCR floor — floor applied", pid)
                 for t in imm_trades:
                     if t.saccr_method == "IMM":
@@ -122,6 +123,8 @@ class PrometheusRunner:
                     "addon_agg": saccr_res.add_on_aggregate,
                 },
                 "imm": imm_res,
+                "ead_imm_csa": imm_res.get("ead_imm_csa", 0) if imm_res else 0,
+                "csa_reduction_pct": imm_res.get("csa_reduction_pct", 0) if imm_res else 0,
                 "frtb": {
                     "sbm_total": frtb_res.sbm_total, "sbm_delta": frtb_res.sbm_delta,
                     "sbm_vega": frtb_res.sbm_vega, "sbm_curvature": frtb_res.sbm_curvature,

@@ -26,6 +26,7 @@ M1 performance (measured):
 """
 
 from __future__ import annotations
+import logging
 import random
 import math
 from datetime import date, timedelta
@@ -130,16 +131,43 @@ def create_derivative_portfolio(
     portfolio_id = new_portfolio_id("DERIVATIVE", book_date)
 
     # ── Netting / CSA setup (req #6) ─────────────────────────────────────────
+    # CSA terms are calibrated to counterparty credit quality:
+    # - Better-rated counterparties receive tighter (lower) thresholds
+    # - Initial Margin scales with portfolio expected notional
+    # - VM is set AFTER trades are built, reflecting actual net portfolio MTM
     netting_id = new_netting_id(counterparty["id"], 1)
+
+    rating = counterparty.get("rating", "BBB")
+    # Threshold: tighter for better-rated counterparties (they can afford zero TH)
+    #   AAA/AA → 0 threshold (zero-threshold bilateral CSA, best terms)
+    #   A       → small threshold ($250K)
+    #   BBB     → moderate threshold ($500K)
+    #   BB/B    → larger threshold ($1M)
+    _th_map = {
+        "AAA": 0, "AA+": 0, "AA": 0, "AA-": 0,
+        "A+": 250_000, "A": 250_000, "A-": 250_000,
+        "BBB+": 500_000, "BBB": 500_000, "BBB-": 500_000,
+        "BB+": 1_000_000, "BB": 1_000_000, "B+": 2_000_000,
+    }
+    threshold = _th_map.get(rating, 500_000)
+
+    # MTA: always low to ensure frequent margin calls
+    mta = rng.choice([100_000, 250_000])
+
+    # Initial Margin placeholder — will be recalculated after trades are known
+    # Rough estimate: 3-5% of expected gross notional for the netting set
+    approx_notional = 50_000_000  # placeholder before trades are known
+    initial_margin  = approx_notional * rng.uniform(0.03, 0.05)
+
     netting = NettingSet(
         netting_id       = netting_id,
         counterparty_id  = counterparty["id"],
-        initial_margin   = rng.uniform(500_000, 5_000_000),
-        variation_margin = rng.uniform(-2_000_000, 2_000_000),
-        threshold        = rng.choice([0, 1_000_000, 2_000_000]),
-        mta              = rng.choice([250_000, 500_000, 1_000_000]),
+        initial_margin   = initial_margin,  # will be updated below
+        variation_margin = 0.0,             # will be set after trades are built
+        threshold        = threshold,
+        mta              = mta,
         has_csa          = True,
-        mpor_days        = 10,
+        mpor_days        = 10,              # CRE52.50: 10-day floor for non-centrally cleared
     )
 
     # ── Full trade template library with exotic options ──────────────────────
@@ -246,6 +274,35 @@ def create_derivative_portfolio(
         trades.append(t)
 
     netting.trades = trades
+
+    # ── Post-build CSA calibration (req #6 — realistic margin) ───────────────
+    # Now that trades exist, calibrate CSA terms to actual portfolio:
+    # (1) VM = max(net_mtm - threshold, 0): simulate a fully-margined portfolio
+    #     where the counterparty has called the last daily margin payment.
+    #     Any in-the-money exposure above threshold is already collateralised.
+    # (2) IM = 3% of gross notional: realistic initial margin for a liquid
+    #     bilateral portfolio (reflects ISDA SIMM or IM schedule).
+    # This is the key change that drives RC → near zero and PFE multiplier → 0.05-0.3
+
+    net_mtm       = sum(t.current_mtm for t in trades)
+    gross_notional = sum(abs(t.notional) for t in trades)
+
+    # VM received = exposure exceeding threshold, fully posted by counterparty
+    vm_received = max(net_mtm - threshold, 0.0)
+    netting.variation_margin = vm_received
+
+    # IM = 3% of gross notional (bilateral ISDA SIMM approximation)
+    netting.initial_margin = gross_notional * 0.03
+
+    logger.debug(
+        "Portfolio %s CSA: net_mtm=%.0f TH=%.0f VM_received=%.0f IM=%.0f "
+        "→ RC_floor=max(%.0f, %.0f)",
+        portfolio_id,
+        net_mtm, threshold, vm_received, netting.initial_margin,
+        net_mtm - vm_received - netting.initial_margin,
+        threshold + mta - netting.initial_margin,
+    )
+
     return portfolio_id, netting, trades
 
 
@@ -417,3 +474,5 @@ def build_full_dataset(
             "total_bbk_exposures":sum(len(p["exposures"]) for p in banking_portfolios),
         },
     }
+
+logger = logging.getLogger(__name__)
