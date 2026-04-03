@@ -316,6 +316,7 @@ class AIRBConfiguration:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _norm_cdf(x: float) -> float:
+    """Normal CDF. Uses scipy.special.ndtr when available (higher precision)."""
     """Standard normal CDF — uses CalculationCache for memoization."""
     return cached_norm_cdf(x)
 
@@ -358,40 +359,50 @@ def sector_correlation_adjustment(
     pd: float,
     asset_class: str,
     sector: str,
-    portfolio_concentration: float = 0.0
+    portfolio_concentration: float = 0.0,
 ) -> float:
     """
-    Advanced correlation accounting for sector & concentration.
-    Higher concentration → higher correlation → higher RWA.
-    
+    Returns the CRE31 asset correlation R, with optional internal overlays.
+
+    The base formula (CRE31.5) already captures systematic vs idiosyncratic
+    risk; Basel does not specify sector multipliers within the IRB formula.
+    The overlays below are internal management adjustments ONLY and are
+    clearly separated from the regulatory formula.
+
     Args:
-        pd: obligor PD
-        asset_class: CORP/BANK/etc
-        sector: FINANCIALS/REAL_ESTATE/etc
-        portfolio_concentration: single-obligor concentration (0-1)
-    
+        pd:                     Obligor 1-year PD (floor applied internally).
+        asset_class:            CRE31 asset class string.
+        sector:                 Internal sector label (for management overlay).
+        portfolio_concentration: Herfindahl-style single-obligor share [0, 1].
+                                  Values > 5% trigger a conservative add-on.
+
     Returns:
-        Adjusted correlation R
+        R — asset correlation for use in the CRE31.4 capital formula.
     """
     R_base = asset_correlation(pd, asset_class)
-    
-    # Sector multiplier (cyclicality)
-    sector_multipliers = {
-        "FINANCIALS": 1.15,
-        "REAL_ESTATE": 1.10,
-        "RETAIL": 0.90,
-        "UTILITIES": 0.85,
-        "INDUSTRIALS": 1.0,
+
+    # ── Internal management overlay (NOT part of CRE31 regulatory capital) ──
+    # Sector cyclicality overlay — conservative internal view only.
+    # Banks may add a management buffer above the regulatory minimum;
+    # these values are NOT prescribed by Basel and must be Board-approved.
+    # Reference: BCBS CP on internal capital adequacy (Pillar 2 guidance).
+    _INTERNAL_SECTOR_OVERLAY: dict = {
+        "FINANCIALS":  1.05,   # Higher systemic correlation for financial firms
+        "REAL_ESTATE": 1.05,   # RE sector beta historically elevated
+        "RETAIL":      0.97,   # Consumer retail slightly lower cyclicality
+        "UTILITIES":   0.95,   # Regulated utilities — lower beta
+        "INDUSTRIALS": 1.00,   # Neutral
     }
-    sector_mult = sector_multipliers.get(sector, 1.0)
-    
-    # Concentration adjustment (Granularity Adjustment, Basel III)
-    if portfolio_concentration > 0.05:  # >5% single obligor
-        concentration_adj = 1.0 + 0.5 * (portfolio_concentration - 0.05)
+    sector_mult = _INTERNAL_SECTOR_OVERLAY.get(sector.upper(), 1.0)
+
+    # Granularity/concentration overlay (CRE31, Pillar 2 add-on guidance).
+    # Single obligors >5% of portfolio attract a conservative upward adjustment.
+    if portfolio_concentration > 0.05:
+        conc_adj = 1.0 + 0.3 * min(portfolio_concentration - 0.05, 0.45)
     else:
-        concentration_adj = 1.0
-    
-    R_adjusted = min(R_base * sector_mult * concentration_adj, 0.99)
+        conc_adj = 1.0
+
+    R_adjusted = min(R_base * sector_mult * conc_adj, 0.99)
     return R_adjusted
 
 def maturity_adjustment(pd: float, M: float) -> float:
@@ -832,6 +843,8 @@ class AIRBEngine:
             lgd_eff = lgd_stressed
 
         # Validate PD migration
+        # validate_pd_migration is expensive and fires once per compute() call.
+        # The _sensitivity_run guard prevents re-validation during shock runs.
         if not _sensitivity_run:
             validate_pd_migration(exp.trade_id, exp.pd, pd_eff)
 

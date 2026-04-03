@@ -44,6 +44,8 @@ class Trade:
     sub_hedging_set:   Optional[str] = None
     saccr_method:      str = "SA_CCR"            # 'SA_CCR' | 'IMM' | 'FALLBACK'
     fallback_trace:    Optional[str] = None
+    supervisory_delta: float = 1.0  # CRE52.37-40: +1 long, -1 short, option value for options
+    credit_quality:    str = "IG"   # 'IG' | 'SG' for credit asset class SF selection
 
 @dataclass
 class NettingSet:
@@ -105,8 +107,11 @@ def maturity_factor(trade: Trade, has_csa: bool, mpor_days: int) -> float:
     today = date.today()
     Mi = max((trade.maturity_date - today).days / 365.0, 10/365.0)
     if has_csa:
+        # CRE52.22: MF = sqrt(MPOR/250) where 250 = business days per year
+        # MPOR in [10, 20] business days (CRE52.6-7)
         MF = math.sqrt(mpor_days / 250.0)
     else:
+        # Unmargined: MF = sqrt(min(M_i, 1)) where M_i in years
         MF = math.sqrt(min(Mi, 1.0))
     return MF
 
@@ -161,8 +166,7 @@ def _effective_notional(trade: Trade, has_csa: bool, mpor_days: int) -> float:
     else:
         d = _adjusted_notional_other(trade)
     MF = maturity_factor(trade, has_csa, mpor_days)
-    delta = getattr(trade, 'supervisory_delta', 1.0)
-    return delta * d * MF
+    return trade.supervisory_delta * d * MF
 
 def _remaining_maturity_years(trade: Trade, as_of: Optional[date] = None) -> float:
     as_of = as_of or date.today()
@@ -234,7 +238,10 @@ def compute_addon_ir(trades: List[Trade], has_csa: bool, mpor_days: int) -> floa
         d2 = sub_bucket.get("MEDIUM", 0.0)
         d3 = sub_bucket.get("LONG", 0.0)
 
-        # CRE52.43 simplified cross-bucket correlation for IR maturity buckets
+        # CRE52.43: IR sub-hedging set aggregation
+        # ρ_SHORT_MED = ρ_MED_LONG = 0.70 → coefficient 2×0.70 = 1.40
+        # ρ_SHORT_LONG = 0.30               → coefficient 2×0.30 = 0.60
+        # Formula: D1² + D2² + D3² + 1.4×D1D2 + 1.4×D2D3 + 0.6×D1D3
         std_component = d1 * d1 + d2 * d2 + d3 * d3 + 1.4 * d1 * d2 + 1.4 * d2 * d3 + 0.6 * d1 * d3
         addon_hs = math.sqrt(max(std_component, 0.0))
 
@@ -268,7 +275,8 @@ def compute_addon_credit(trades: List[Trade], has_csa: bool, mpor_days: int) -> 
     for t in trades:
         if t.asset_class != "CR":
             continue
-        sf_key = "CR_IG"  # simplified; real implementation grades CDS
+        # CRE52.47: SF depends on credit quality (IG vs SG)
+        sf_key = "CR_IG" if getattr(t, "credit_quality", "IG").upper() == "IG" else "CR_SG"
         en = _effective_notional(t, has_csa, mpor_days) * t.direction * SF[sf_key]
         hs = _resolve_hedging_set(t)
         shs = _resolve_sub_hedging_set(t)
@@ -427,6 +435,7 @@ class SACCREngine:
         """
         Req #9: determine SA-CCR vs IMM per trade.
         Records fallback trace code.
+        Also validates supervisory_delta is in {-1, +1} for non-option trades.
         """
         if trade.saccr_method == "IMM":
             eligible, trace = check_imm_eligibility(trade)
@@ -435,4 +444,15 @@ class SACCREngine:
                 trade.fallback_trace = trace
                 logger.warning("Trade %s: IMM → SA-CCR fallback. Reason: %s",
                                trade.trade_id, trace)
+
+        # CRE52.37: validate supervisory_delta direction
+        # For linear instruments delta must be +1 or -1 exactly
+        linear = {"IRS", "CRS", "OIS", "FXFwd", "EquityFwd", "TRS", "CommodityFwd"}
+        if trade.instrument_type in linear and trade.supervisory_delta not in (1.0, -1.0):
+            logger.warning(
+                "Trade %s: supervisory_delta=%.4f for linear instrument %s; "
+                "expected ±1. Clamping to sign.",
+                trade.trade_id, trade.supervisory_delta, trade.instrument_type
+            )
+            trade.supervisory_delta = 1.0 if trade.supervisory_delta >= 0 else -1.0
         return trade

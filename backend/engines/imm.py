@@ -325,8 +325,12 @@ class MonteCarloEngine:
         """
         v = vol or self.p.ir_vol
         κ = self.p.mean_reversion
-        θ = r0   # flat curve simplification
-        
+        # CRE53: θ = long-run mean target rate.
+        # Setting θ=r0 collapses the model to a zero-drift Ornstein-Uhlenbeck process
+        # centred at the current rate — correct only if the curve is flat.
+        # Production: calibrate θ from the OIS forward curve.
+        θ = self.p.long_run_rate if hasattr(self.p, "long_run_rate") else r0
+
         # Generate scenarios + antithetic
         Z = self.rng.standard_normal((self.N, self.T))
         r = np.zeros((self.N, self.T + 1))
@@ -374,13 +378,15 @@ class MonteCarloEngine:
         if ac in ("EQ", "FX"):
             if cache_key not in cache:
                 paths = self.simulate_gbm(S0=1.0, asset_class=ac)
+                cache[cache_key] = paths      # store for reuse
             else:
                 paths = cache[cache_key]
             mtm = n * d * (paths - 1.0)
-        
+
         elif ac == "IR":
             if cache_key not in cache:
                 r_paths = self.simulate_hull_white()
+                cache[cache_key] = r_paths    # store for reuse
             else:
                 r_paths = cache[cache_key]
             r0 = 0.05
@@ -397,6 +403,7 @@ class MonteCarloEngine:
             # CDS: exposure ~ spread widening × duration
             if cache_key not in cache:
                 spread_paths = self.simulate_gbm(S0=0.01, vol=0.50)
+                cache[cache_key] = spread_paths   # store for reuse
             else:
                 spread_paths = cache[cache_key]
             duration = max((trade.maturity_date - date.today()).days / 365.0, 0.1)
@@ -405,6 +412,7 @@ class MonteCarloEngine:
         elif ac == "CMDTY":
             if cache_key not in cache:
                 paths = self.simulate_gbm(S0=1.0, vol=0.30)
+                cache[cache_key] = paths          # store for reuse
             else:
                 paths = cache[cache_key]
             mtm = n * d * (paths - 1.0)

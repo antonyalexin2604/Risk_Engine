@@ -1,7 +1,7 @@
 """
 PROMETHEUS Risk Platform — Premium Light Dashboard
 Aesthetic: Refined Institutional Light · Warm whites · Deep slate · Crimson accents
-Typography: Playfair Display (titles) · IBM Plex Mono (numbers) · Inter (body)
+Typography: DM Serif Display (titles) · JetBrains Mono (numbers) · Inter (body)
 """
 import sys, os
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -27,39 +27,42 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:wght@400;600;700&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@300;400;500;600&display=swap');
 
 :root {
-  --cream:      #fafaf7;
+  --cream:        #fafaf8;
   --white:      #ffffff;
-  --stone-50:   #f8f7f4;
-  --stone-100:  #f0ede8;
-  --stone-200:  #e4dfd7;
-  --stone-300:  #cfc8bd;
+  --stone-50:     #f7f6f3;
+  --stone-100:    #eeebe5;
+  --stone-200:    #dedad1;
+  --stone-300:    #c9c2b6;
   --slate-500:  #64748b;
   --slate-600:  #475569;
   --slate-700:  #334155;
   --slate-900:  #0f172a;
-  --crimson:    #b91c1c;
-  --crimson-lt: #dc2626;
-  --crimson-bg: rgba(185,28,28,0.06);
-  --blue:       #1d4ed8;
+  --crimson:      #991b1b;
+  --crimson-lt:   #c53030;
+  --crimson-bg:   rgba(153,27,27,0.055);
+  --blue:         #1e40af;
   --blue-lt:    #3b82f6;
-  --blue-bg:    rgba(29,78,216,0.06);
-  --green:      #15803d;
-  --green-bg:   rgba(21,128,61,0.07);
-  --amber:      #b45309;
-  --amber-bg:   rgba(180,83,9,0.07);
+  --blue-bg:      rgba(30,64,175,0.055);
+  --green:        #166534;
+  --green-bg:     rgba(22,101,52,0.065);
+  --amber:        #92400e;
+  --amber-bg:     rgba(146,64,14,0.065);
   --teal:       #0f766e;
-  --indigo:     #4338ca;
-  --gold:       #92400e;
-  --border:     #e4dfd7;
-  --shadow-sm:  0 1px 3px rgba(15,23,42,0.06), 0 1px 2px rgba(15,23,42,0.04);
-  --shadow-md:  0 4px 12px rgba(15,23,42,0.08), 0 2px 4px rgba(15,23,42,0.04);
+  --indigo:       #3730a3
+  --teal-bg:      rgba(15,118,110,0.065);
+  --gold:         #78350f;
+  --border:       #dedad1
+  --border-light: #eeebe5;
+  --shadow-xs:    0 1px 2px rgba(15,23,42,0.04)
+  --shadow-sm:    0 1px 3px rgba(15,23,42,0.07), 0 1px 2px rgba(15,23,42,0.04);
+  --shadow-md:    0 4px 14px rgba(15,23,42,0.09), 0 2px 4px rgba(15,23,42,0.04);
 }
 
 /* ── Global ── */
-.stApp { background: var(--stone-50) !important; font-family: 'Inter', sans-serif; }
+.stApp { background: var(--cream) !important; font-family: 'Nunito Sans', sans-serif; }
 .main .block-container { padding: 1.8rem 2.2rem 3rem !important; max-width: 100% !important; }
 
 /* ── Sidebar ── */
@@ -94,7 +97,7 @@ label     { color: var(--slate-600) !important; }
 .stButton > button {
   background: var(--slate-900) !important; color: #fff !important;
   border: none !important; border-radius: 8px !important;
-  font-family: 'Inter', sans-serif !important; font-weight: 500 !important;
+  font-family: 'Nunito Sans', sans-serif !important; font-weight: 500 !important;
   letter-spacing: 0.02em !important; padding: 0.5rem 1.4rem !important;
   box-shadow: var(--shadow-sm) !important; transition: all 0.15s !important;
 }
@@ -105,7 +108,7 @@ label     { color: var(--slate-600) !important; }
 }
 
 /* ── Metrics ── */
-[data-testid="stMetricValue"] { color: var(--slate-900) !important; font-family: 'IBM Plex Mono', monospace !important; }
+[data-testid="stMetricValue"] { color: var(--slate-900) !important; font-family: 'JetBrains Mono', monospace !important; }
 [data-testid="stMetricLabel"] { color: var(--slate-500) !important; font-size: 0.75rem !important; text-transform: uppercase; letter-spacing: 0.05em; }
 
 /* ── Dividers ── */
@@ -114,60 +117,73 @@ hr { border-color: var(--stone-200) !important; margin: 1rem 0 !important; }
 /* ── Info/Success/Error banners ── */
 .stAlert { border-radius: 8px !important; border-left-width: 3px !important; }
 
+/* ── Dataframe ── */
+.stDataFrame { border-radius: 10px !important; overflow: hidden; }
+[data-testid="stDataFrameResizable"] { border-radius: 10px !important; }
+
+/* ── Spinner accent ── */
+.stSpinner > div { border-top-color: var(--crimson) !important; }
+
 /* ── Custom Components ── */
 .wordmark {
-  font-family: 'Playfair Display', serif;
-  font-size: 1.4rem; font-weight: 700;
-  color: var(--slate-900); letter-spacing: 0.02em;
+  font-family: 'DM Serif Display', serif;
+  font-size: 1.52rem; font-weight: 400;
+  color: var(--slate-900); letter-spacing: 0.01em; line-height: 1.1;
 }
-.wordmark span { color: var(--crimson); }
+.wordmark span { color: var(--crimson); font-style: italic; }
 .submark {
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 0.62rem; color: var(--slate-500);
-  letter-spacing: 0.14em; text-transform: uppercase; margin-top: -3px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.58rem; color: var(--stone-400);
+  letter-spacing: 0.19em; text-transform: uppercase; margin-top: 0;
+  font-weight: 300;
 }
 
 .page-title {
-  font-family: 'Playfair Display', serif;
-  font-size: 1.8rem; font-weight: 700;
-  color: var(--slate-900); line-height: 1.15; margin-bottom: 0;
+  font-family: 'DM Serif Display', serif;
+  font-size: 2.1rem; font-weight: 400;
+  color: var(--slate-900); line-height: 1.05; margin-bottom: 0;
+  letter-spacing: -0.01em;
 }
 .page-sub {
-  font-family: 'IBM Plex Mono', monospace;
-  font-size: 0.70rem; color: var(--slate-500);
-  letter-spacing: 0.09em; text-transform: uppercase; margin-bottom: 1.5rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.66rem; color: var(--slate-500);
+  letter-spacing: 0.11em; text-transform: uppercase; margin-bottom: 1.8rem;
+  font-weight: 300;
 }
 
 /* KPI card */
 .kpi {
   background: var(--white);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 18px 18px 14px;
+  border-radius: 12px;
+  padding: 20px 20px 16px;
   box-shadow: var(--shadow-sm);
   position: relative; overflow: hidden;
+  transition: box-shadow 0.18s ease, transform 0.18s ease;
 }
-.kpi::after {
+.kpi:hover { box-shadow: var(--shadow-md); transform: translateY(-1px); }
+.kpi::before {
   content: '';
   position: absolute;
-  bottom: 0; left: 0; right: 0; height: 2px;
-  background: linear-gradient(90deg, var(--crimson), transparent);
-  opacity: 0.4;
+  top: 0; left: 0; right: 0; height: 2px;
+  background: linear-gradient(90deg, var(--crimson) 0%, rgba(153,27,27,0.12) 65%, transparent 100%);
+  border-radius: 12px 12px 0 0;
 }
-.kpi-sup  { font-family:'IBM Plex Mono',monospace; font-size:0.62rem; font-weight:600; letter-spacing:0.12em; text-transform:uppercase; color:var(--slate-400); margin-bottom:5px; }
-.kpi-val  { font-family:'IBM Plex Mono',monospace; font-size:1.75rem; font-weight:600; color:var(--slate-900); line-height:1.1; margin-bottom:3px; }
-.kpi-lbl  { font-size:0.79rem; color:var(--slate-500); margin-bottom:7px; }
-.kpi-tag  { display:inline-block; font-family:'IBM Plex Mono',monospace; font-size:0.64rem; font-weight:500; padding:2px 7px; border-radius:4px; }
-.t-ok     { background:var(--green-bg);  color:var(--green); }
-.t-warn   { background:var(--amber-bg);  color:var(--amber); }
-.t-bad    { background:var(--crimson-bg);color:var(--crimson); }
-.t-blue   { background:var(--blue-bg);   color:var(--blue); }
-.t-stone  { background:var(--stone-100); color:var(--slate-600); }
+.kpi-sup  { font-family:'JetBrains Mono',monospace; font-size:0.60rem; font-weight:500; letter-spacing:0.15em; text-transform:uppercase; color:var(--slate-400); margin-bottom:5px; }
+.kpi-val  { font-family:'JetBrains Mono',monospace; font-size:1.82rem; font-weight:600; color:var(--slate-900); line-height:1.05; margin-bottom:4px; letter-spacing:-0.01em; }
+.kpi-lbl  { font-family:'Nunito Sans',sans-serif; font-size:0.78rem; color:var(--slate-500); margin-bottom:8px; font-weight:400; line-height:1.4; }
+.kpi-tag  { display:inline-block; font-family:'JetBrains Mono',monospace; font-size:0.64rem; font-weight:500; padding:2px 8px; border-radius:5px; letter-spacing:0.03em; }
+.t-ok     { background:var(--green-bg);  color:var(--green);   border:1px solid rgba(22,101,52,0.14); }
+.t-warn   { background:var(--amber-bg);  color:var(--amber);   border:1px solid rgba(146,64,14,0.14); }
+.t-bad    { background:var(--crimson-bg);color:var(--crimson); border:1px solid rgba(153,27,27,0.14); }
+.t-blue   { background:var(--blue-bg);   color:var(--blue);    border:1px solid rgba(30,64,175,0.14); }
+.t-teal   { background:var(--teal-bg);   color:var(--teal);    border:1px solid rgba(15,118,110,0.14); }
+.t-stone  { background:var(--stone-100); color:var(--slate-600);border:1px solid var(--border); }
 
 /* Section header */
-.sh { display:flex; align-items:center; gap:12px; margin:26px 0 13px; }
+.sh { display:flex; align-items:center; gap:14px; margin:28px 0 14px; }
 .sh-line { flex:1; height:1px; background:var(--stone-200); }
-.sh-text { font-family:'IBM Plex Mono',monospace; font-size:0.66rem; font-weight:600; color:var(--slate-400); letter-spacing:0.13em; text-transform:uppercase; white-space:nowrap; }
+.sh-text { font-family:'JetBrains Mono',monospace; font-size:0.63rem; font-weight:400; color:var(--slate-400); letter-spacing:0.16em; text-transform:uppercase; white-space:nowrap; }
 
 /* Limit row */
 .lrow {
@@ -179,8 +195,8 @@ hr { border-color: var(--stone-200) !important; margin: 1rem 0 !important; }
   box-shadow:var(--shadow-sm);
 }
 .ln  { font-size:0.83rem; font-weight:500; color:var(--slate-700); }
-.lt  { font-family:'IBM Plex Mono',monospace; font-size:0.62rem; color:var(--slate-400); margin-top:2px; }
-.lv  { font-family:'IBM Plex Mono',monospace; font-size:0.80rem; color:var(--slate-600); text-align:right; }
+.lt  { font-family:'JetBrains Mono',monospace; font-size:0.62rem; color:var(--slate-400); margin-top:2px; }
+.lv  { font-family:'JetBrains Mono',monospace; font-size:0.80rem; color:var(--slate-600); text-align:right; }
 
 /* Regulatory tag sidebar */
 .reg-row { display:flex; justify-content:space-between; padding:5px 8px;
@@ -188,37 +204,43 @@ hr { border-color: var(--stone-200) !important; margin: 1rem 0 !important; }
 
 /* Floor banner */
 .floor-ok {
-  background: var(--green-bg); border:1px solid rgba(21,128,61,0.18);
-  border-radius:8px; padding:11px 16px; font-size:0.83rem; color:var(--green);
+  background: var(--green-bg); border:1px solid rgba(22,101,52,0.18);
+  border-radius:10px; padding:12px 18px; font-size:0.82rem; color:var(--green);
+  font-family:'Nunito Sans',sans-serif; font-weight:500;
 }
 .floor-warn {
-  background: var(--crimson-bg); border:1px solid rgba(185,28,28,0.18);
-  border-radius:8px; padding:11px 16px; font-size:0.83rem; color:var(--crimson);
+  background: var(--crimson-bg); border:1px solid rgba(153,27,27,0.18);
+  border-radius:10px; padding:12px 18px; font-size:0.82rem; color:var(--crimson);
+  font-family:'Nunito Sans',sans-serif; font-weight:500;
 }
 </style>
 """, unsafe_allow_html=True)
 
 # ── Colour palette ────────────────────────────────────────────────────────────
 C = {
-    "blue":   "#1d4ed8",
-    "indigo": "#4338ca",
-    "teal":   "#0f766e",
-    "green":  "#15803d",
-    "amber":  "#b45309",
-    "red":    "#b91c1c",
-    "crimson":"#991b1b",
-    "slate":  "#64748b",
-    "gold":   "#92400e",
+    "blue":    "#1e40af",
+    "indigo":  "#3730a3",
+    "teal":    "#0f766e",
+    "green":   "#166534",
+    "amber":   "#92400e",
+    "red":     "#991b1b",
+    "crimson": "#7f1d1d",
+    "slate":   "#64748b",
+    "gold":    "#78350f",
 }
-CHART_COLS = [C["blue"], C["indigo"], C["teal"], C["gold"], C["amber"], C["slate"]]
+CHART_COLS = [C["blue"], C["indigo"], C["teal"], C["gold"], C["amber"], C["green"], C["slate"]]
 
 def PLOT(h=360, t=10):
     return dict(
-        paper_bgcolor="#ffffff", plot_bgcolor="#fafaf7",
-        font_color="#64748b", font_family="IBM Plex Mono", font_size=10,
-        height=h, margin=dict(l=20, r=20, t=t, b=20),
-        xaxis=dict(gridcolor="#e4dfd7", linecolor="#e4dfd7", tickcolor="#e4dfd7", zeroline=False),
-        yaxis=dict(gridcolor="#e4dfd7", linecolor="#e4dfd7", tickcolor="#e4dfd7", zeroline=False),
+        paper_bgcolor="#ffffff", plot_bgcolor="#f7f6f3",
+        font_color="#64748b", font_family="JetBrains Mono", font_size=10,
+        height=h, margin=dict(l=24, r=24, t=t, b=24),
+        xaxis=dict(gridcolor="#dedad1", linecolor="#dedad1", tickcolor="#dedad1", zeroline=False,
+                   tickfont=dict(family="JetBrains Mono", size=9)),
+        yaxis=dict(gridcolor="#dedad1", linecolor="#dedad1", tickcolor="#dedad1", zeroline=False,
+                   tickfont=dict(family="JetBrains Mono", size=9)),
+        hoverlabel=dict(bgcolor="#ffffff", font_color="#334155",
+                        font_family="JetBrains Mono", font_size=11, bordercolor="#dedad1"),
     )
 
 def LEG(orientation="h", y=1.08, x=0):
@@ -253,7 +275,7 @@ def gauge(value, minimum, label):
     col  = C["green"] if pct >= minp * 1.15 else (C["amber"] if pct >= minp else C["red"])
     fig  = go.Figure(go.Indicator(
         mode="gauge+number", value=pct,
-        number={"suffix": "%", "font": {"size": 28, "color": col, "family": "IBM Plex Mono"}},
+        number={"suffix": "%", "font": {"size": 28, "color": col, "family": "JetBrains Mono"}},
         title={"text": label, "font": {"size": 11, "color": "#64748b", "family": "Inter"}},
         gauge={
             "axis": {"range": [0, hi], "tickcolor": "#cfc8bd", "tickfont": {"color": "#cfc8bd", "size": 9}},
@@ -283,7 +305,7 @@ with st.sidebar:
 
     run_date = st.date_input("Valuation Date", value=date.today(), max_value=date.today())
     st.markdown(
-        f'<div style="font-family:IBM Plex Mono;font-size:0.65rem;color:#94a3b8;'
+        f'<div style="font-family:JetBrains Mono;font-size:0.65rem;color:#94a3b8;'
         f'margin-top:-8px;margin-bottom:14px">{run_date.strftime("%d %b %Y")}</div>',
         unsafe_allow_html=True)
 
@@ -295,7 +317,7 @@ with st.sidebar:
 
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown(
-        '<div style="font-family:IBM Plex Mono;font-size:0.62rem;color:#94a3b8;'
+        '<div style="font-family:JetBrains Mono;font-size:0.62rem;color:#94a3b8;'
         'letter-spacing:0.12em;text-transform:uppercase;padding:0 8px;'
         'margin-bottom:8px">Regulatory Basis</div>',
         unsafe_allow_html=True)
@@ -306,7 +328,7 @@ with st.sidebar:
     ]:
         st.markdown(
             f'<div class="reg-row">'
-            f'<span style="font-family:IBM Plex Mono;color:{C["crimson"]};'
+            f'<span style="font-family:JetBrains Mono;color:{C["crimson"]};'
             f'font-size:0.68rem;font-weight:500">{code}</span>'
             f'<span style="color:#94a3b8;font-size:0.75rem">{desc}</span></div>',
             unsafe_allow_html=True)
@@ -355,13 +377,13 @@ if page == "Capital Dashboard":
             marker=dict(colors=CHART_COLS, line=dict(color="#ffffff", width=2)),
             hole=0.50,
             textinfo="percent",
-            textfont=dict(family="IBM Plex Mono", size=10),
+            textfont=dict(family="JetBrains Mono", size=10),
             hovertemplate="<b>%{label}</b><br>%{customdata}<extra></extra>",
             customdata=[fmt_bn(v) for v in vals],
         ))
         fig_pie.add_annotation(
             text=fmt_bn(sum(vals)), x=0.5, y=0.5, showarrow=False,
-            font=dict(family="IBM Plex Mono", size=15, color="#0f172a"))
+            font=dict(family="JetBrains Mono", size=15, color="#0f172a"))
         fig_pie.update_layout(**PLOT(340, 10), showlegend=True,
                                legend=LEG("v", 0.5, 1.02))
         st.plotly_chart(fig_pie)
@@ -372,7 +394,7 @@ if page == "Capital Dashboard":
             marker=dict(color=CHART_COLS, opacity=0.85),
             text=[f"  {fmt_bn(v)}" for v in vals],
             textposition="outside",
-            textfont=dict(family="IBM Plex Mono", size=10, color="#64748b"),
+            textfont=dict(family="JetBrains Mono", size=10, color="#64748b"),
             cliponaxis=False,
         ))
         fig_bar.update_layout(**PLOT(340, 10), xaxis_title="USD Millions")
@@ -412,7 +434,7 @@ if page == "Capital Dashboard":
             f'<div class="floor-ok">✓  Output Floor not triggered — '
             f'Pre-floor {fmt_bn(pre_floor)} ≥ Floor {fmt_bn(floor_rwa)}'
             f'<span style="color:{C["teal"]};margin-left:14px;'
-            f'font-family:IBM Plex Mono;font-size:0.68rem">'
+            f'font-family:JetBrains Mono;font-size:0.68rem">'
             f'CVA excluded from floor base · CAP10 FAQ1</span></div>',
             unsafe_allow_html=True)
 
@@ -445,7 +467,7 @@ elif page == "Derivative Portfolios":
         x=list(addons.keys()), y=[v/1e6 for v in addons.values()],
         marker=dict(color=CHART_COLS[:5], opacity=0.85),
         text=[f"${v/1e6:.2f}M" for v in addons.values()],
-        textposition="outside", textfont=dict(family="IBM Plex Mono",size=10,color="#64748b")))
+        textposition="outside", textfont=dict(family="JetBrains Mono",size=10,color="#64748b")))
     fig_add.update_layout(**PLOT(280,10), yaxis_title="USD Millions")
     st.plotly_chart(fig_add)
 
@@ -525,7 +547,7 @@ elif page == "Banking Book":
                     name=label, x=[v/1e6], y=["CRM Benefit"],
                     orientation="h", marker_color=colour, opacity=0.85,
                     text=[f"${v/1e6:.1f}M"], textposition="inside",
-                    textfont=dict(family="IBM Plex Mono", size=9, color="#fff"),
+                    textfont=dict(family="JetBrains Mono", size=9, color="#fff"),
                 ))
             fig_m.update_layout(**PLOT(120,10), barmode="stack",
                                 xaxis_title="USD Millions", legend=LEG())
@@ -658,7 +680,7 @@ elif page == "IMM Exposure Profiles":
         kpi(c4,"Stressed EAD",fmt_bn(imm["stressed_ead"]), "GFC 2007–09 calibration",  "Stressed",    "t-warn")
 
         st.markdown(
-            f'<div style="font-family:IBM Plex Mono;font-size:0.66rem;color:#94a3b8;'
+            f'<div style="font-family:JetBrains Mono;font-size:0.66rem;color:#94a3b8;'
             f'margin-bottom:8px">Scenarios: {imm["scenario_count"]:,} · '
             f'Steps: {imm["time_steps"]} · Runtime: {imm["runtime_seconds"]:.2f}s</div>',
             unsafe_allow_html=True)
@@ -836,8 +858,8 @@ elif page == "Reports":
 st.markdown(
     f'<div style="margin-top:3rem;padding-top:1rem;border-top:1px solid var(--stone-200);'
     f'display:flex;justify-content:space-between;align-items:center">'
-    f'<span style="font-family:Playfair Display,serif;color:var(--stone-300);font-size:1rem">⬡ PROMETHEUS</span>'
-    f'<span style="font-family:IBM Plex Mono;font-size:0.63rem;color:var(--stone-300);letter-spacing:0.08em">'
+    f'<span style="font-family:DM Serif Display,serif;color:var(--stone-300);font-size:1rem">⬡ PROMETHEUS</span>'
+    f'<span style="font-family:JetBrains Mono;font-size:0.63rem;color:var(--stone-300);letter-spacing:0.08em">'
     f'{run_date.strftime("%d %b %Y")} · CRE52 · CRE53 · CRE31 · MAR21-33 · MAR50 · RBC20 · CONFIDENTIAL'
     f'</span></div>',
     unsafe_allow_html=True)

@@ -279,7 +279,9 @@ class CVAResult:
 # BA-CVA (Basic Approach) — MAR50.20–50.38
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Supervisory credit spread by sector/rating (MAR50 Table 1 — simplified mapping)
+# Supervisory credit spread by sector/rating (MAR50 Table 1 — MAR50.25)
+# These map internal ratings to the Basel supervisory credit spread parameters.
+# Full table: AAA=0.38%, AA=0.38%, A=0.42%, BBB=0.54%, BB=1.06%, B=1.60%, CCC=6.00%
 _SUPERVISORY_SPREAD: Dict[str, float] = {
     "AAA": 0.0038,  # 38 bps
     "AA":  0.0038,
@@ -400,6 +402,7 @@ def compute_sa_cva(
     """
     SA-CVA per MAR50.40+.
     Requires actual credit spread data per counterparty.
+    Note: Cleared trades (MAR50.8) are excluded from CVA — filter inputs before calling.
 
     Delta charge ≈ RW × ΔS/S × EAD × M_eff
     Vega charge  ≈ 0.55 × |vega sensitivity| (simplified)
@@ -446,7 +449,12 @@ def compute_sa_cva(
             rw_spread = 0.0160 * hy_ratio
 
         delta_charge = rw_spread * delta_sens
-        vega_charge  = 0.55 * delta_charge * 0.10   # simplified vega component
+        # MAR50.45: Vega risk arises from implied volatility of hedging instruments.
+        # For a self-contained simulation without explicit option hedges, vega
+        # is typically zero for direct CVA (no optionality in the exposure driver).
+        # The 0.55×delta×0.10 heuristic had no regulatory basis.
+        # Production: compute ∂CVA/∂σ from Greeks of hedging swaptions/FX options.
+        vega_charge  = 0.0   # Set to zero; override when option hedges are present
 
         rwa_delta = delta_charge * 12.5
         rwa_vega  = vega_charge  * 12.5
