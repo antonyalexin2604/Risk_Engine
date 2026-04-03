@@ -231,7 +231,26 @@ class CorrelationModel:
         self.intra_corr = intra_corr
         self.inter_corr = inter_corr
 
+    # GIRR tenor grid per MAR21 (3m,6m,1y,2y,3y,5y,10y,15y,20y,30y)
+    _GIRR_TENORS: List[float] = [0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 10.0, 15.0, 20.0, 30.0]
+
     def intra(self, risk_class: str, n: int) -> np.ndarray:
+        """
+        For GIRR: tenor-gap correlations per MAR21.58
+            ρ(t1,t2) = exp(−θ × |ln(t1/t2)|),  θ = 0.03
+        For all other risk classes: homogeneous scalar from config.
+        """
+        if risk_class == "GIRR":
+            tenors = self._GIRR_TENORS
+            # Extend/truncate tenor list to match n
+            t_list = (tenors * ((n // len(tenors)) + 1))[:n]
+            mat = np.ones((n, n), dtype=np.float64)
+            for i in range(n):
+                for j in range(n):
+                    if i != j:
+                        t1, t2 = t_list[i], t_list[j]
+                        mat[i, j] = math.exp(-0.03 * abs(math.log(t1 / t2)))
+            return mat
         ρ = self.intra_corr.get(risk_class, 0.5)
         mat = np.full((n, n), ρ, dtype=np.float64)
         np.fill_diagonal(mat, 1.0)
@@ -378,10 +397,16 @@ class FRTBResult:
     capital_market_risk: float
     rwa_market: float
 
+    # New capital components
+    drc_charge:    float = 0.0   # Default Risk Charge (MAR22)
+    rrao_charge_v: float = 0.0   # Residual Risk Add-On (MAR23.5)
+    pla_zone:      str   = "N/A" # PLA test zone (GREEN/AMBER/RED/N/A)
+
     # Optional breakdowns / details
     sbm_by_risk_class: Dict[str, float] = field(default_factory=dict)
-    sbm_by_bucket: Dict[str, float] = field(default_factory=dict)
-    ima_components: Dict[str, float] = field(default_factory=dict)
+    sbm_by_bucket:     Dict[str, float] = field(default_factory=dict)
+    ima_components:    Dict[str, float] = field(default_factory=dict)
+    drc_by_quality:    Dict[str, Any]   = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize result to a plain dict (JSON/CSV/Parquet friendly)."""
@@ -609,14 +634,46 @@ class SBMCalculator:
             raise FRTBCalculationError(f"Delta charge calculation failed for {risk_class}: {e}")
 
     def vega_charge(self, sensitivities: Sequence[Sensitivity], risk_class: str) -> float:
-        """Vega charge using vega sensitivities — simplified as scaled absolute vega."""
+        """
+        MAR21: Vega charge via the same two-stage intra/inter bucket aggregation as delta.
+
+        WS_k = RW_vega × VR_k   (VR = vega sensitivity to implied vol)
+        K_b  = √(Σ WS_k² + Σ_{k≠l} ρ_kl WS_k WS_l)   [intra-bucket]
+        Δ    = √(Σ K_b² + Σ_{b≠c} γ_bc K_b K_c)       [inter-bucket]
+        """
         try:
             senses = [s for s in sensitivities if s.risk_class == risk_class and s.vega != 0]
             if not senses:
                 return 0.0
-            total_vega = sum(abs(s.vega) for s in senses)
-            rw = self.config.vega_rw.get(risk_class, 0.55)
-            result = rw * total_vega * 0.30
+
+            rw_vega = self.config.vega_rw.get(risk_class, 0.55)
+
+            # bucket → list of WS (weighted vega sensitivities)
+            buckets: Dict[str, List[float]] = {}
+            for s in senses:
+                ws = rw_vega * s.vega
+                buckets.setdefault(s.bucket, []).append(ws)
+
+            # Intra-bucket aggregation
+            K_b: Dict[str, float] = {}
+            for b, ws_list in buckets.items():
+                ws_arr = np.array(ws_list, dtype=np.float64)
+                n = len(ws_arr)
+                if n == 0:
+                    K_b[b] = 0.0
+                    continue
+                corr_mat = self._intra_corr_mat(risk_class, n)
+                K_sq = float(ws_arr @ corr_mat @ ws_arr)
+                K_b[b] = math.sqrt(max(K_sq, 0.0))
+
+            # Inter-bucket aggregation
+            K_arr = np.array(list(K_b.values()), dtype=np.float64)
+            if len(K_arr) == 0:
+                return 0.0
+            corr_inter = self._inter_corr_mat(risk_class, len(K_arr))
+            charge_sq  = float(K_arr @ corr_inter @ K_arr)
+            result     = math.sqrt(max(charge_sq, 0.0))
+
             if math.isnan(result) or math.isinf(result):
                 raise FRTBCalculationError(f"Vega charge produced NaN/inf for {risk_class}")
             return result
@@ -624,24 +681,111 @@ class SBMCalculator:
             raise FRTBCalculationError(f"Vega charge calculation failed for {risk_class}: {e}")
 
     def curvature_charge(self, sensitivities: Sequence[Sensitivity], risk_class: str) -> float:
-        """MAR23: curvature = max(0, Σ CVR_k) aggregated with correlation scenarios."""
+        """
+        MAR23.6: Curvature charge under three correlation scenarios.
+
+        CVR_k = -min(CVR_up_k, CVR_dn_k, 0)   per risk factor
+        For each correlation scenario s ∈ {low, medium, high}:
+            ρ_s  = ρ_base scaled by {0.75², 1.0, min(1.25,1)}
+            K_b  = √max(Σ CVR_k² + Σ_{k≠l} ρ_s² × CVR_k × CVR_l, 0)
+            ψ_b  = Σ CVR_k if K_b < 0 else 0   (negative bucket treatment)
+            Ξ_s  = Σ_b K_b² + Σ_{b≠c} γ_s × K_b × K_c + Σ_b ψ_b
+        Result = max(max(Ξ_s), 0)
+        """
         try:
             senses = [s for s in sensitivities if s.risk_class == risk_class]
             if not senses:
                 return 0.0
-            cvr = [max(-(min(s.curvature_up, s.curvature_dn)), 0) for s in senses]
+
+            # CVR_k = -min(CVR_up, CVR_dn, 0) per MAR23.3
+            cvr = [-min(s.curvature_up, s.curvature_dn, 0.0) for s in senses]
             cvr_arr = np.array(cvr, dtype=np.float64)
             n = len(cvr_arr)
             if n == 0:
                 return 0.0
-            ρ_mat = self._intra_corr_mat(risk_class, n)
-            agg = float(cvr_arr @ ρ_mat @ cvr_arr)
-            result = math.sqrt(max(agg, 0.0)) + float(cvr_arr.sum())
+
+            # Three intra-correlation scenarios (MAR23.6)
+            base_intra = self._intra_corr_mat(risk_class, n)
+            base_inter_scalar = self.config.inter_corr.get(risk_class, 0.5)
+
+            scenario_charges = []
+            for rho_scale in [0.75**2, 1.0, min(1.25, 1.0)]:
+                # Scale intra correlation matrix (off-diagonals only)
+                ρ_mat = np.ones_like(base_intra)
+                for i in range(n):
+                    for j in range(n):
+                        if i != j:
+                            ρ_mat[i, j] = min(base_intra[i, j] * rho_scale, 1.0)
+
+                # Bucket-level aggregation
+                bucket_names = [s.bucket for s in senses]
+                unique_buckets = list(dict.fromkeys(bucket_names))
+
+                K_b_vals = []
+                psi_b_vals = []
+                for b in unique_buckets:
+                    idx = [i for i, s in enumerate(senses) if s.bucket == b]
+                    cvr_b = cvr_arr[idx]
+                    n_b = len(cvr_b)
+                    if n_b == 0:
+                        K_b_vals.append(0.0)
+                        psi_b_vals.append(0.0)
+                        continue
+                    ρ_b = ρ_mat[np.ix_(idx, idx)]
+                    K_sq = float(cvr_b @ ρ_b @ cvr_b)
+                    K_b_v = math.sqrt(max(K_sq, 0.0))
+                    K_b_vals.append(K_b_v)
+                    # ψ_b = Σ CVR_k if K_b² < 0 (i.e. negative scenario)
+                    psi_b_vals.append(float(cvr_b.sum()) if K_sq < 0 else 0.0)
+
+                K_b_arr = np.array(K_b_vals)
+                m = len(K_b_arr)
+                # Inter-bucket aggregation
+                γ_s = min(base_inter_scalar * rho_scale, 1.0)
+                inter_mat = np.full((m, m), γ_s)
+                np.fill_diagonal(inter_mat, 1.0)
+                xi = float(K_b_arr @ inter_mat @ K_b_arr) + sum(psi_b_vals)
+                scenario_charges.append(xi)
+
+            result = max(max(scenario_charges), 0.0)
+            result = math.sqrt(result) if result > 0 else 0.0
+
             if math.isnan(result) or math.isinf(result):
                 raise FRTBCalculationError(f"Curvature charge produced NaN/inf for {risk_class}")
             return result
         except (ValueError, TypeError) as e:
             raise FRTBCalculationError(f"Curvature charge calculation failed for {risk_class}: {e}")
+
+
+    def rrao_charge(
+        self,
+        sensitivities: Sequence[Sensitivity],
+        notionals_by_instrument: Optional[Dict[str, Tuple[float, str]]] = None,
+    ) -> float:
+        """
+        MAR23.5: Residual Risk Add-On (RRAO).
+
+        Instruments with exotic underlyings: 1.0% × gross notional
+        Instruments with gap/correlation/behavioural risk: 0.1% × gross notional
+
+        Args:
+            notionals_by_instrument: {trade_id: (notional, instrument_type)}
+              instrument_type: 'EXOTIC' | 'RESIDUAL' | 'VANILLA'
+              If None, derives a conservative estimate from sensitivities.
+        """
+        if notionals_by_instrument is not None:
+            exotic_notional   = sum(n for n,t in notionals_by_instrument.values() if t=='EXOTIC')
+            residual_notional = sum(n for n,t in notionals_by_instrument.values() if t=='RESIDUAL')
+        else:
+            # Conservative: treat all non-linear (non-zero curvature) sensitivities
+            # as residual risk; exotic is zero (cannot distinguish without trade data)
+            exotic_notional   = 0.0
+            residual_notional = sum(
+                abs(s.delta) * 1000  # rough notional proxy from delta
+                for s in sensitivities
+                if (s.curvature_up != 0 or s.curvature_dn != 0)
+            )
+        return 0.010 * exotic_notional + 0.001 * residual_notional
 
     def total_sbm(
         self,
@@ -661,14 +805,46 @@ class SBMCalculator:
         bucket_breakdown: Dict[str, float] = {}
 
         for rc in self.config.risk_classes:
-            rc_bucket_breakdown: Dict[str, float] = {}
-            d = self.delta_charge(sensitivities, rc, breakdown_by_bucket=rc_bucket_breakdown, market=market)
+            # MAR21.6: Compute delta under three correlation scenarios;
+            # take the maximum as the regulatory charge.
+            base_intra  = self.config.intra_corr.get(rc, 0.5)
+            base_inter  = self.config.inter_corr.get(rc, 0.3)
+            delta_scenarios = []
+            for intra_scale, inter_scale in [
+                (0.75**2, 0.75**2),   # low scenario
+                (1.0,     1.0),       # medium (base)
+                (min(1.0 + 0.25*(1.0 - base_intra)/max(base_intra,0.01), 1.0),
+                 min(1.0 + 0.25*(1.0 - base_inter)/max(base_inter,0.01), 1.0)),  # high
+            ]:
+                # Temporarily scale the correlation model
+                orig_intra = self.config.correlation_model.intra_corr.copy()
+                orig_inter = self.config.correlation_model.inter_corr.copy()
+                self.config.correlation_model.intra_corr[rc] = min(base_intra * intra_scale, 0.9999)
+                self.config.correlation_model.inter_corr[rc] = max(
+                    min(base_inter * inter_scale, 1.0), -1.0)
+                self._intra_cache.clear()
+                self._inter_cache.clear()
+                rc_bucket_breakdown_s: Dict[str, float] = {}
+                d_s = self.delta_charge(sensitivities, rc,
+                                        breakdown_by_bucket=rc_bucket_breakdown_s,
+                                        market=market)
+                delta_scenarios.append((d_s, rc_bucket_breakdown_s))
+                # Restore
+                self.config.correlation_model.intra_corr = orig_intra
+                self.config.correlation_model.inter_corr = orig_inter
+                self._intra_cache.clear()
+                self._inter_cache.clear()
+
+            # Best scenario = highest charge (MAR21.6)
+            best_idx = int(np.argmax([x[0] for x in delta_scenarios]))
+            d = delta_scenarios[best_idx][0]
+            rc_bucket_breakdown = delta_scenarios[best_idx][1]
+
             v = self.vega_charge(sensitivities, rc)
             c = self.curvature_charge(sensitivities, rc)
             delta_charges[rc] = d
-            vega_charges[rc] = v
-            curv_charges[rc] = c
-            # merge bucket breakdowns with risk_class prefix
+            vega_charges[rc]  = v
+            curv_charges[rc]  = c
             for b, val in rc_bucket_breakdown.items():
                 bucket_breakdown[f"{rc}:{b}"] = val
 
@@ -778,6 +954,79 @@ class IMACalculator:
         except (ValueError, TypeError) as e:
             raise FRTBCalculationError(f"ES computation failed: {e}")
 
+
+    # Liquidity horizon per risk class (MAR33.12, Table 1)
+    # Key = risk_class string, Value = LH in days
+    LIQUIDITY_HORIZONS: Dict[str, int] = {
+        "GIRR":    10,
+        "FX":      10,
+        "EQ_LARGE":20,   # Large-cap equity
+        "EQ":      40,   # Small-cap equity (conservative)
+        "CSR_NS":  40,   # Credit spread non-securitisation
+        "CSR_SEC": 60,   # Credit spread securitisation
+        "CMDTY":   20,   # Commodity (liquid)
+        "CMDTY_ILLIQUID": 60,
+    }
+    # Five liquidity horizon buckets (MAR33.4 Table 1)
+    LH_BUCKETS = [10, 20, 40, 60, 120]  # j = 1..5
+
+    def compute_es_lh_adjusted(
+        self,
+        pnl_by_risk_class: Dict[str, np.ndarray],
+        stressed: bool = False,
+        method: str = "historical",
+    ) -> float:
+        """
+        MAR33.4: Liquidity-horizon-adjusted ES.
+
+        ES = √[ ES_T(full)²
+               + Σ_{j=2..5} ES_T(P_j)² × (LH_j - LH_{j-1}) / T ]
+
+        where P_j = sub-portfolio of risk factors with LH ≥ LH_j.
+        T = base horizon = 10 days.
+
+        If only one risk class is present (or pnl_by_risk_class has one key),
+        falls back to simple scaling.
+        """
+        T = self.config.holding_period_days  # 10
+        LH = self.LH_BUCKETS  # [10, 20, 40, 60, 120]
+
+        if not pnl_by_risk_class:
+            return 0.0
+
+        # Full portfolio ES (j=1, all risk factors, scaled to LH1=10d)
+        full_pnl = np.sum(list(pnl_by_risk_class.values()), axis=0)
+        es_full  = float(self.compute_es(full_pnl, stressed=False, method=method))
+
+        result_sq = es_full ** 2  # already at 10d
+
+        # For each higher liquidity horizon bucket, compute partial ES
+        for j_idx in range(1, len(LH)):
+            lh_j      = LH[j_idx]
+            lh_j_prev = LH[j_idx - 1]
+
+            # Sub-portfolio: only risk factors with LH ≥ lh_j
+            partial_pnls = []
+            for rc, pnl in pnl_by_risk_class.items():
+                rc_lh = self.LIQUIDITY_HORIZONS.get(rc, 10)
+                if rc_lh >= lh_j:
+                    partial_pnls.append(pnl)
+
+            if not partial_pnls:
+                continue
+
+            partial_pnl = np.sum(partial_pnls, axis=0)
+            es_partial_1d = float(self.compute_es(partial_pnl, stressed=False, method=method))
+            # Scale to base 10d (compute_es already does √10 scaling, undo then redo)
+            es_partial_10d = es_partial_1d  # compute_es returns 10d
+
+            result_sq += es_partial_10d ** 2 * (lh_j - lh_j_prev) / T
+
+        lh_es = math.sqrt(max(result_sq, 0.0))
+        if stressed:
+            lh_es *= self.config.stressed_es_multiplier
+        return max(lh_es, 0.0)
+
     def nmrf_charge(self, n_nmrf_factors: int, avg_notional: float) -> float:
         """
         MAR31.14: NMRF charge = 99th-pct loss for each NMRF.
@@ -797,6 +1046,129 @@ class IMACalculator:
         except (ValueError, TypeError) as e:
             raise FRTBCalculationError(f"NMRF charge calculation failed: {e}")
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DRC — Default Risk Charge (MAR22 SBM / MAR33.18 IMA)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class DRCPosition:
+    """Single position for DRC calculation."""
+    trade_id:       str
+    notional:       float          # gross notional (positive = long, negative = short)
+    lgd:            float          # loss given default [0,1]; typically 0.45–1.0
+    market_value:   float          # current market value of the position
+    credit_quality: str            # 'AAA','AA','A','BBB','BB','B','CCC','DEFAULT'
+    maturity_years: float = 1.0    # residual maturity in years (for maturity cap)
+    asset_class:    str   = "CORP" # CORP | SOVERIGN | SECURITISATION
+
+# Supervisory DRC risk weights per credit quality (MAR22, Table MAR22.2)
+_DRC_RW: Dict[str, float] = {
+    "AAA":     0.005,
+    "AA":      0.02,
+    "A":       0.03,
+    "BBB":     0.06,
+    "BB":      0.15,
+    "B":       0.30,
+    "CCC":     0.50,
+    "DEFAULT": 1.00,
+    "UNRATED": 0.15,
+}
+
+class DRCCalculator:
+    """
+    Standardised Default Risk Charge per MAR22.
+
+    Algorithm:
+      1. Compute gross JTD per position:
+           JTD_long  = max(LGD × Notional − MV,  0)  for long positions
+           JTD_short = max(−LGD × Notional + MV, 0)  for short positions
+      2. Net long vs short within the same credit quality bucket.
+         Short positions can only offset 50% of long JTD (MAR22.24).
+      3. Apply supervisory risk weight per quality bucket.
+      4. Sum across all buckets → DRC.
+    """
+
+    def compute(self, positions: List[DRCPosition]) -> Dict[str, Any]:
+        """
+        Compute standardised DRC for a list of positions.
+        Returns dict with total DRC and bucket breakdown.
+        """
+        if not positions:
+            return {"drc_total": 0.0, "by_quality": {}, "jtd_net": 0.0}
+
+        # Step 1: Gross JTD per position
+        long_jtd_by_q:  Dict[str, float] = {}
+        short_jtd_by_q: Dict[str, float] = {}
+
+        for pos in positions:
+            q   = pos.credit_quality.upper()
+            rw  = _DRC_RW.get(q, _DRC_RW["UNRATED"])
+
+            if pos.notional >= 0:
+                # Long position: JTD = max(LGD × N − MV, 0)
+                jtd = max(pos.lgd * pos.notional - pos.market_value, 0.0)
+                long_jtd_by_q[q] = long_jtd_by_q.get(q, 0.0) + jtd
+            else:
+                # Short position: JTD_short = max(−LGD × N + MV, 0)
+                jtd = max(-pos.lgd * pos.notional + pos.market_value, 0.0)
+                short_jtd_by_q[q] = short_jtd_by_q.get(q, 0.0) + jtd
+
+        # Step 2: Net JTD per bucket, 50% short offset (MAR22.24)
+        drc_total = 0.0
+        by_quality: Dict[str, Dict[str, float]] = {}
+        all_qualities = set(list(long_jtd_by_q.keys()) + list(short_jtd_by_q.keys()))
+
+        for q in all_qualities:
+            rw     = _DRC_RW.get(q, _DRC_RW["UNRATED"])
+            jtd_l  = long_jtd_by_q.get(q, 0.0)
+            jtd_s  = short_jtd_by_q.get(q, 0.0)
+            # Net JTD = long JTD − 50% of short JTD (conservative offset)
+            net_jtd = max(jtd_l - 0.50 * jtd_s, 0.0)
+            drc_q   = rw * net_jtd
+            drc_total += drc_q
+            by_quality[q] = {
+                "jtd_long": jtd_l, "jtd_short": jtd_s,
+                "jtd_net": net_jtd, "rw": rw, "drc": drc_q,
+            }
+
+        return {
+            "drc_total":  drc_total,
+            "by_quality": by_quality,
+            "jtd_net":    sum(v["jtd_net"] for v in by_quality.values()),
+        }
+
+    @staticmethod
+    def positions_from_sensitivities(
+        sensitivities: Sequence["Sensitivity"],
+        avg_notional: float = 1_000_000,
+    ) -> List[DRCPosition]:
+        """
+        Derive approximate DRC positions from credit sensitivities.
+        Used when explicit position data is unavailable (fallback).
+        Quality bucket derived from bucket number heuristic.
+        """
+        quality_map = {
+            "1":  "AAA",  "2":  "AA",   "3":  "A",   "4":  "BBB",
+            "5":  "BBB",  "6":  "BB",   "7":  "BB",  "8":  "B",
+            "9":  "B",   "10": "CCC",  "11": "CCC", "12": "DEFAULT",
+        }
+        positions = []
+        for s in sensitivities:
+            if s.risk_class not in ("CSR_NS", "CSR_SEC"):
+                continue
+            q = quality_map.get(s.bucket, "BBB")
+            # Notional proxy from delta sensitivity
+            notional = s.delta * 10_000  # 1bp delta → approximate notional
+            if abs(notional) < 1:
+                notional = avg_notional * (1 if s.delta >= 0 else -1)
+            positions.append(DRCPosition(
+                trade_id=s.trade_id, notional=notional,
+                lgd=0.45, market_value=0.0,
+                credit_quality=q, maturity_years=1.0,
+            ))
+        return positions
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FRTB Master Engine
@@ -826,6 +1198,25 @@ class FRTBEngine:
         self.ima = IMACalculator(self.config)
         logger.info("FRTB Engine initialised (SBM + IMA, MAR21-33)")
 
+
+    def _ima_multiplier(self, backtesting_exceptions: int = 0) -> float:
+        """
+        MAR33.9: IMA multiplier mc = 1.5 + add-on based on backtesting exceptions.
+
+        Exceptions (250d):  0-4 → +0.00  (green)
+                            5   → +0.20
+                            6   → +0.26
+                            7   → +0.33
+                            8   → +0.38
+                            9   → +0.42
+                           10+  → +0.50  (red zone, model revocation risk)
+        """
+        addon_table = {0:0.0, 1:0.0, 2:0.0, 3:0.0, 4:0.0,
+                       5:0.20, 6:0.26, 7:0.33, 8:0.38, 9:0.42}
+        addon = addon_table.get(backtesting_exceptions,
+                                0.50 if backtesting_exceptions >= 10 else 0.0)
+        return 1.5 + addon
+
     # ---- core compute -----------------------------------------------------
 
     def compute(
@@ -838,7 +1229,20 @@ class FRTBEngine:
         run_date: Optional[date] = None,
         es_method: str = "historical",
         market_conditions: Optional[MarketConditions] = None,
+        backtesting_exceptions: int = 0,
+        pnl_by_risk_class: Optional[Dict[str, np.ndarray]] = None,
+        drc_positions: Optional[List[DRCPosition]] = None,
+        notionals_by_instrument: Optional[Dict[str, tuple]] = None,
+        rtpl: Optional[np.ndarray] = None,
+        hpl: Optional[np.ndarray] = None,
     ) -> FRTBResult:
+        """
+        backtesting_exceptions: number of VaR exceptions in the 250-day window.
+            Drives the IMA multiplier per MAR33.9 (1.50 to 2.00).
+        pnl_by_risk_class: {risk_class: pnl_array} for liquidity-horizon-adjusted ES.
+            If provided, ES is computed using the MAR33.4 five-horizon formula.
+            If None, falls back to simple √10 scaling (backward compatible).
+        """
         """
         Compute complete FRTB capital charge with optional real-time market overlay.
         
@@ -874,22 +1278,51 @@ class FRTBEngine:
             delta_t, vega_t, curv_t, sbm_t, sbm_by_rc, sbm_by_bucket = self.sbm.total_sbm(agg_sens, market=market)
 
             # ── IMA / ES ──
-            if pnl_series is not None and len(pnl_series) > 0:
-                es_base = self.ima.compute_es(pnl_series, stressed=False, method=es_method)
-                es_stressed = self.ima.compute_es(pnl_series, stressed=True, method=es_method)
+            if pnl_by_risk_class:
+                # MAR33.4: liquidity-horizon-adjusted ES (preferred path)
+                es_base    = self.ima.compute_es_lh_adjusted(pnl_by_risk_class, stressed=False, method=es_method)
+                es_stressed= self.ima.compute_es_lh_adjusted(pnl_by_risk_class, stressed=True,  method=es_method)
+            elif pnl_series is not None and len(pnl_series) > 0:
+                es_base    = self.ima.compute_es(pnl_series, stressed=False, method=es_method)
+                es_stressed= self.ima.compute_es(pnl_series, stressed=True,  method=es_method)
             else:
                 logger.info("No PnL series provided; generating synthetic for demonstration")
                 rng = np.random.default_rng(42)
                 pnl_series = rng.normal(0, avg_notional * 0.01, self.config.backtesting_window)
-                es_base = self.ima.compute_es(pnl_series, stressed=False, method=es_method)
-                es_stressed = self.ima.compute_es(pnl_series, stressed=True, method=es_method)
+                es_base    = self.ima.compute_es(pnl_series, stressed=False, method=es_method)
+                es_stressed= self.ima.compute_es(pnl_series, stressed=True,  method=es_method)
 
             nmrf_ch = self.ima.nmrf_charge(n_nmrf, avg_notional)
-            ima_t = max(es_base, es_stressed) + nmrf_ch
+            ima_t   = max(es_base, es_stressed) + nmrf_ch
 
-            # Capital = max(SBM_total, m_c × IMA_total)   [MAR33.8]
-            capital = max(sbm_t, self.config.ima_multiplier * ima_t)
-            rwa = capital * 12.5
+            # ── DRC (MAR22 / MAR33.18) ──────────────────────────────────────
+            drc_calc = DRCCalculator()
+            if drc_positions is None:
+                drc_positions = DRCCalculator.positions_from_sensitivities(
+                    agg_sens, avg_notional)
+            drc_result  = drc_calc.compute(drc_positions)
+            drc_total   = drc_result["drc_total"]
+            drc_by_qual = drc_result["by_quality"]
+
+            # ── RRAO (MAR23.5) ───────────────────────────────────────────────
+            rrao_total = self.sbm.rrao_charge(agg_sens, notionals_by_instrument)
+
+            # ── PLA test (MAR32) — desk IMA eligibility ───────────────────────
+            pla_zone = "N/A"
+            if rtpl is not None and hpl is not None:
+                pla_res  = self.pla_test(rtpl, hpl)
+                pla_zone = pla_res["zone"]
+                if pla_zone == "RED":
+                    logger.warning(
+                        "FRTB [%s]: PLA test FAILED (RED) — desk forced to SBM", portfolio_id)
+                    ima_t = 0.0   # IMA not available; SBM dominates
+
+            # Capital = max(SBM + DRC + RRAO, mc × IMA + DRC)   [MAR33.8-33.9]
+            mc = self._ima_multiplier(backtesting_exceptions)
+            sbm_with_extras = sbm_t + drc_total + rrao_total
+            ima_with_drc    = mc * ima_t + drc_total
+            capital = max(sbm_with_extras, ima_with_drc)
+            rwa     = capital * 12.5
 
             logger.info(
                 "FRTB [%s] SBM=%.0f  IMA=%.0f  Capital=%.0f  RWA=%.0f",
@@ -902,6 +1335,21 @@ class FRTBEngine:
                 "nmrf_charge": nmrf_ch,
                 "ima_total": ima_t,
             }
+
+            ima_components = {
+                "es_base_10d":    es_base,
+                "es_stressed_10d":es_stressed,
+                "nmrf_charge":    nmrf_ch,
+                "ima_total":      ima_t,
+                "drc_total":      drc_total,
+                "rrao_total":     rrao_total,
+            }
+
+            logger.info(
+                "FRTB [%s] SBM=%.0f  DRC=%.0f  RRAO=%.0f  IMA=%.0f  "
+                "Capital=%.0f  RWA=%.0f  PLA=%s",
+                portfolio_id, sbm_t, drc_total, rrao_total, ima_t, capital, rwa, pla_zone
+            )
 
             return FRTBResult(
                 run_date=run_date,
@@ -917,9 +1365,13 @@ class FRTBEngine:
                 ima_total=ima_t,
                 capital_market_risk=capital,
                 rwa_market=rwa,
+                drc_charge=drc_total,
+                rrao_charge_v=rrao_total,
+                pla_zone=pla_zone,
                 sbm_by_risk_class=sbm_by_rc,
                 sbm_by_bucket=sbm_by_bucket,
                 ima_components=ima_components,
+                drc_by_quality=drc_by_qual,
             )
 
         except (FRTBValidationError, FRTBCalculationError) as e:
@@ -930,6 +1382,65 @@ class FRTBEngine:
             raise FRTBCalculationError(f"Unexpected error: {e}")
 
     # ---- batch processing -------------------------------------------------
+
+
+    def pla_test(
+        self,
+        rtpl: np.ndarray,
+        hpl: np.ndarray,
+    ) -> Dict[str, Any]:
+        """
+        MAR32.10: Profit & Loss Attribution (PLA) test.
+
+        Compares RTPL (risk-theoretical P&L, using approved risk factors only)
+        against HPL (hypothetical P&L, full desk revaluation).
+
+        Green zone:  Spearman ≥ 0.80  AND  KS p-value ≥ 0.05
+        Amber zone:  (Spearman ≥ 0.70  OR  KS p-value ≥ 0.05) and not Green
+        Red zone:    Spearman < 0.70  AND  KS p-value < 0.05
+                     → desk must revert to SBM
+
+        Returns dict with zone, statistics, and capital surcharge flag.
+        """
+        try:
+            from scipy.stats import spearmanr, ks_2samp
+        except ImportError:
+            logger.warning("scipy not available — PLA test using simplified statistics")
+            # Fallback: Pearson correlation as proxy for Spearman
+            n = min(len(rtpl), len(hpl))
+            rtpl_s, hpl_s = rtpl[:n], hpl[:n]
+            mean_r, mean_h = rtpl_s.mean(), hpl_s.mean()
+            corr = float(np.dot(rtpl_s-mean_r, hpl_s-mean_h) / (
+                np.linalg.norm(rtpl_s-mean_r) * np.linalg.norm(hpl_s-mean_h) + 1e-12))
+            return {"zone": "GREEN" if corr >= 0.80 else "AMBER" if corr >= 0.70 else "RED",
+                    "spearman": corr, "ks_pvalue": 0.10, "note": "scipy unavailable"}
+
+        n = min(len(rtpl), len(hpl))
+        rtpl_s, hpl_s = rtpl[:n], hpl[:n]
+
+        spearman_corr, _ = spearmanr(rtpl_s, hpl_s)
+        ks_stat, ks_pvalue = ks_2samp(rtpl_s, hpl_s)
+
+        spearman_corr = float(spearman_corr)
+        ks_pvalue     = float(ks_pvalue)
+
+        if spearman_corr >= 0.80 and ks_pvalue >= 0.05:
+            zone = "GREEN"
+        elif spearman_corr >= 0.70 or ks_pvalue >= 0.05:
+            zone = "AMBER"
+        else:
+            zone = "RED"
+
+        logger.info("PLA test: Spearman=%.3f  KS_p=%.3f  → %s zone", spearman_corr, ks_pvalue, zone)
+
+        return {
+            "zone":           zone,
+            "spearman":       spearman_corr,
+            "ks_stat":        ks_stat,
+            "ks_pvalue":      ks_pvalue,
+            "ima_eligible":   zone in ("GREEN", "AMBER"),
+            "capital_surcharge_required": zone == "AMBER",
+        }
 
     def compute_batch(
         self,

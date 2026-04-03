@@ -275,21 +275,115 @@ class PrometheusRunner:
         return results
 
     def _generate_sensitivities(self, pid: str, trades) -> List[Sensitivity]:
+        """
+        Generate realistic FRTB sensitivities per MAR21.
+
+        Key rules applied:
+          - Vega is always >= 0 (options have positive vega by definition)
+          - Curvature is non-zero ONLY for instruments with optionality
+            (options, swaptions, barriers, caps/floors, variance swaps)
+          - Asset class → FRTB risk class mapping is exact
+          - GIRR bucket based on instrument tenor (maturity bucket)
+          - CSR bucket based on credit quality proxy
+        """
         import random
         rng = random.Random(hash(pid) % 2**31)
-        rc_map = {"IR": "GIRR", "FX": "FX", "EQ": "EQ", "CR": "CSR_NS", "CMDTY": "CMDTY"}
-        return [
-            Sensitivity(
-                trade_id=t.trade_id, risk_class=rc_map.get(t.asset_class, "GIRR"),
-                bucket=str(rng.randint(1, 5)),
-                risk_factor=f"{t.asset_class}_FACTOR_{rng.randint(1,3)}",
-                delta=rng.uniform(-t.notional*0.001, t.notional*0.001),
-                vega=rng.uniform(0, t.notional*0.0005),
-                curvature_up=rng.uniform(-t.notional*0.0002, 0),
-                curvature_dn=rng.uniform(-t.notional*0.0002, 0),
-            )
-            for t in trades
-        ]
+
+        # MAR21 risk class mapping
+        rc_map = {
+            "IR":    "GIRR",
+            "FX":    "FX",
+            "EQ":    "EQ",
+            "CR":    "CSR_NS",
+            "CMDTY": "CMDTY",
+        }
+
+        # Instrument types with optionality → non-zero vega and curvature
+        OPTIONALITY_TYPES = {
+            "IRCap", "IRFloor", "Swaption", "BermudanSwap",
+            "FXOption", "FXBarrier", "FXAsianOption",
+            "EquityFwd", "VarSwap", "EquityBarrier", "BasketOption",
+            "CommodityOption", "SpreadOption",
+        }
+
+        def _girr_bucket(trade) -> str:
+            """Map trade maturity to GIRR tenor bucket (3m,6m,1y,2y,3y,5y,10y,15y,20y,30y)."""
+            from datetime import date
+            ttm = max((trade.maturity_date - date.today()).days / 365.0, 0.0)
+            if ttm < 0.5:   return "1"   # 3m
+            if ttm < 1.0:   return "2"   # 6m
+            if ttm < 1.5:   return "3"   # 1y
+            if ttm < 2.5:   return "4"   # 2y
+            if ttm < 4.0:   return "5"   # 3y
+            if ttm < 7.5:   return "6"   # 5y
+            if ttm < 12.5:  return "7"   # 10y
+            if ttm < 17.5:  return "8"   # 15y
+            if ttm < 25.0:  return "9"   # 20y
+            return "10"  # 30y
+
+        sensitivities = []
+        for t in trades:
+            rc = rc_map.get(t.asset_class, "GIRR")
+            has_optionality = t.instrument_type in OPTIONALITY_TYPES
+
+            # Bucket assignment
+            if rc == "GIRR":
+                bucket = _girr_bucket(t)
+                risk_factor = f"{t.notional_ccy}_TENOR_{bucket}"
+            elif rc == "CSR_NS":
+                bucket = str(rng.randint(1, 8))   # credit quality buckets 1-8
+                risk_factor = f"CSR_{bucket}_{t.trade_id[:8]}"
+            elif rc == "EQ":
+                bucket = str(rng.randint(1, 10))
+                risk_factor = f"EQ_SECTOR_{bucket}"
+            elif rc == "FX":
+                bucket = "1"
+                risk_factor = getattr(t, 'notional_ccy', 'USD') + "_USD"
+            else:  # CMDTY
+                bucket = str(rng.randint(1, 11))
+                risk_factor = f"CMDTY_{bucket}"
+
+            # Delta: directional, scaled to 1bp sensitivity
+            # Long positions have positive delta, shorts negative
+            direction = getattr(t, 'direction', 1)
+            delta_base = t.notional * 0.0001  # 1bp × notional
+            delta = direction * delta_base * rng.uniform(0.5, 1.5)
+
+            # Vega: ALWAYS non-negative; zero for non-option instruments
+            if has_optionality:
+                # Vega scales with notional and implied vol level
+                vega = t.notional * 0.0003 * rng.uniform(0.5, 2.0)
+            else:
+                vega = 0.0
+
+            # Curvature: ONLY for instruments with optionality
+            # curvature_up/dn represent P&L under ±1RW shock
+            # For long options: both curvature_up and curvature_dn are positive (convex)
+            # For short options: both are negative (concave)
+            if has_optionality:
+                gamma_base = t.notional * 0.00005 * rng.uniform(0.3, 1.0)
+                if direction > 0:
+                    curvature_up = gamma_base * rng.uniform(0.8, 1.2)
+                    curvature_dn = gamma_base * rng.uniform(0.8, 1.2)
+                else:
+                    curvature_up = -gamma_base * rng.uniform(0.8, 1.2)
+                    curvature_dn = -gamma_base * rng.uniform(0.8, 1.2)
+            else:
+                curvature_up = 0.0
+                curvature_dn = 0.0
+
+            sensitivities.append(Sensitivity(
+                trade_id=t.trade_id,
+                risk_class=rc,
+                bucket=bucket,
+                risk_factor=risk_factor,
+                delta=delta,
+                vega=vega,
+                curvature_up=curvature_up,
+                curvature_dn=curvature_dn,
+            ))
+
+        return sensitivities
 
 
 if __name__ == "__main__":
