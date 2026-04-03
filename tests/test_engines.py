@@ -424,15 +424,19 @@ class TestFRTB:
         """Delta charge must be non-negative."""
         engine = FRTBEngine()
         senses = [self.make_sensitivity("GIRR", 1_000_000)]
-        d, v, c, total = engine.sbm.total_sbm(senses)
+        d, v, c, total, sbm_by_rc, sbm_by_bucket = engine.sbm.total_sbm(senses)
         assert d >= 0
         assert total >= 0
+        assert isinstance(sbm_by_rc, dict)
+        assert isinstance(sbm_by_bucket, dict)
 
     def test_empty_sensitivities(self):
         """No sensitivities → zero charge."""
         engine = FRTBEngine()
-        d, v, c, total = engine.sbm.total_sbm([])
+        d, v, c, total, sbm_by_rc, sbm_by_bucket = engine.sbm.total_sbm([])
         assert total == 0.0
+        assert sbm_by_rc == {} or all(v == 0 for v in sbm_by_rc.values())
+        assert sbm_by_bucket == {}
 
     def test_netting_reduces_charge(self):
         """Long + short same bucket → lower charge than two longs."""
