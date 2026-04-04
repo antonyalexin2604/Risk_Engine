@@ -97,6 +97,7 @@ class MarketParams:
     stressed_vol: float = 0.40     # σ stressed (2007-09)
     # Hull-White IR parameters
     mean_reversion: float = 0.10   # κ
+    long_run_rate:  float = 0.045   # θ (OU long-run mean rate — calibrated from OIS forward curve)
     ir_vol: float = 0.015          # σ_r
     ir_stressed_vol: float = 0.030
     # Correlations: factor model

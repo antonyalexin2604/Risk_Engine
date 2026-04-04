@@ -17,6 +17,7 @@ CVA RWA excluded from output floor base (CAP10 FAQ1).
 
 from __future__ import annotations
 import logging
+import os
 import numpy as np
 from datetime import date
 from typing import Dict, List
@@ -31,6 +32,7 @@ from backend.engines.ccp     import compute_ccp_rwa
 from backend.data_generators.portfolio_generator import build_full_dataset
 from backend.data_generators.cva_generator      import build_cva_inputs, build_ccp_exposures
 from backend.data_sources.persistence           import ensure_schema, persist_run
+from backend.data_sources.calibration           import calibrate_and_apply
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,8 +40,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("prometheus.runner")
 
-OP_RISK_ENABLED  = False
-OP_RISK_RWA_STUB = 0.0
+from backend.config import (
+    OPERATIONAL_RISK_ENABLED, OPERATIONAL_RISK_BIA_FACTOR,
+    OPERATIONAL_RISK_GROSS_INCOME,
+)
+# OPE25 Basic Indicator Approach stub
+# Enable via env: PROMETHEUS_OP_RISK=1
+# Set gross income in config.py: OPERATIONAL_RISK_GROSS_INCOME = <3Y avg>
+OP_RISK_ENABLED  = OPERATIONAL_RISK_ENABLED
+OP_RISK_RWA_STUB = (
+    OPERATIONAL_RISK_GROSS_INCOME * OPERATIONAL_RISK_BIA_FACTOR * 12.5
+    if OPERATIONAL_RISK_ENABLED and OPERATIONAL_RISK_GROSS_INCOME > 0
+    else 0.0
+)
 
 
 class PrometheusRunner:
@@ -51,6 +64,24 @@ class PrometheusRunner:
         self.cva      = CVAEngine(sa_cva_approved=sa_cva_approved)
         self.backtest = BacktestEngine()
         self.db_ok    = ensure_schema()   # create tables if they don't exist
+
+        # Live market calibration — can be skipped via env var for tests/CI
+        _skip_cal = os.getenv("PROMETHEUS_SKIP_CALIBRATION", "0") == "1"
+        if not _skip_cal:
+            self.calibration = calibrate_and_apply(
+                market_params=None,
+                lookback_days=252,
+            )
+            if hasattr(self.imm, 'engine') and hasattr(self.imm.engine, 'p'):
+                self.calibration.apply_to_imm(self.imm.engine.p)
+            elif hasattr(self.imm, 'p'):
+                self.calibration.apply_to_imm(self.imm.p)
+        else:
+            from backend.data_sources.calibration import CalibratedParams
+            self.calibration = CalibratedParams(
+                calibration_date=date.today().isoformat(),
+                data_quality="skipped"
+            )
 
     def run_daily(self, run_date: date = None) -> Dict:
         run_date = run_date or date.today()

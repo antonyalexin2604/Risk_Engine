@@ -328,6 +328,7 @@ with st.sidebar:
     page = st.radio("", [
         "Capital Dashboard", "Derivative Portfolios", "Banking Book",
         "Market Risk (FRTB)", "IMM Exposure Profiles",
+        "CVA Risk", "CCP Exposure",
         "Risk Limits", "Backtesting", "Reports",
     ], label_visibility="collapsed")
 
@@ -881,6 +882,185 @@ elif page == "Backtesting":
 # ══════════════════════════════════════════════════════════════════════════════
 # 8 · REPORTS
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# CVA RISK — MAR50
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "CVA Risk":
+    st.markdown('<div class="page-title">CVA Risk Capital</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-sub">MAR50 · BA-CVA / SA-CVA · Fallback Routing · Hedge Benefit</div>',
+                unsafe_allow_html=True)
+
+    method_tag = {"SA_CVA":"t-blue","BA_CVA":"t-warn","CCR_PROXY":"t-bad"}.get(cva.get("method","BA_CVA"),"t-stone")
+    sa_rwa = cva.get("by_method",{}).get("SA_CVA",0)
+    ba_rwa = cva.get("by_method",{}).get("BA_CVA",0)
+    px_rwa = cva.get("by_method",{}).get("CCR_PROXY",0)
+    hred   = cva.get("hedge_rwa_reduction",0)
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    kpi(c1,"CVA Method",        cva.get("method","—"),           "Approach in use",        "MAR50",          method_tag)
+    kpi(c2,"Total CVA RWA",     fmt_bn(cva.get("total_rwa_cva",0)), "Aggregate charge",    "MAR50.20+",      "t-blue")
+    kpi(c3,"SA-CVA RWA",        fmt_bn(sa_rwa),                  "Sensitivity-based",      "Approved desks", "t-blue"   if sa_rwa>0 else "t-stone")
+    kpi(c4,"BA-CVA RWA",        fmt_bn(ba_rwa),                  "Basic approach",         "All others",     "t-warn"   if ba_rwa>0 else "t-stone")
+    kpi(c5,"Hedge Benefit",     fmt_bn(hred),                    "CVA hedge RWA reduction","MAR50.32",       "t-ok"     if hred>0 else "t-stone")
+
+    # ── Method breakdown donut ─────────────────────────────────────────────
+    sec("CVA CAPITAL — SA vs BA vs PROXY SPLIT")
+    method_vals = [(k, v) for k, v in cva.get("by_method",{}).items() if v > 0]
+    if method_vals:
+        left, right = st.columns(2)
+        with left:
+            fig_donut = go.Figure(go.Pie(
+                labels=[m for m,_ in method_vals],
+                values=[v for _,v in method_vals],
+                hole=0.55,
+                marker=dict(colors=[C["blue"],C["amber"],C["red"]][:len(method_vals)],
+                            line=dict(color="#ffffff",width=2)),
+                textinfo="percent+label",
+                textfont=dict(family="JetBrains Mono",size=10),
+                hovertemplate="<b>%{label}</b><br>%{customdata}<extra></extra>",
+                customdata=[fmt_bn(v) for _,v in method_vals],
+            ))
+            fig_donut.add_annotation(x=0.5,y=0.5,text=fmt_bn(cva.get("total_rwa_cva",0)),
+                showarrow=False,font=dict(family="JetBrains Mono",size=14,color="#0f172a"))
+            fig_donut.update_layout(**PLOT(300,10),showlegend=True,legend=LEG("v",0.5,1.02))
+            st.plotly_chart(fig_donut)
+        with right:
+            if hred > 0:
+                fig_hedge = go.Figure(go.Bar(
+                    x=["Pre-Hedge CVA RWA","Hedge Benefit","Post-Hedge CVA RWA"],
+                    y=[(cva.get("total_rwa_cva",0)+hred)/1e6, -hred/1e6,
+                       cva.get("total_rwa_cva",0)/1e6],
+                    marker=dict(color=[C["blue"],C["green"],C["teal"]],opacity=0.85),
+                    text=[fmt_bn((cva.get("total_rwa_cva",0)+hred)),fmt_bn(-hred),
+                          fmt_bn(cva.get("total_rwa_cva",0))],
+                    textposition="outside",
+                    textfont=dict(family="JetBrains Mono",size=10),
+                ))
+                fig_hedge.update_layout(**PLOT(300,10),yaxis_title="USD Millions")
+                st.plotly_chart(fig_hedge)
+            else:
+                st.info("No CVA hedges in current portfolio — hedge benefit is zero.")
+
+    # ── Counterparty-level breakdown ───────────────────────────────────────
+    sec("COUNTERPARTY CVA DETAIL — MAR50")
+    cpts = cva.get("counterparties",[])
+    if cpts:
+        cdf = pd.DataFrame(cpts)
+        cdf["rwa_cva"]      = cdf["rwa_cva"].apply(fmt_bn)
+        cdf["cva_estimate"] = cdf["cva_estimate"].apply(fmt_bn)
+        rename = {"counterparty_id":"Counterparty","method":"Method",
+                  "rwa_cva":"CVA RWA","cva_estimate":"CVA Estimate",
+                  "fallback_trace":"Fallback Trace","has_hedge":"Hedged"}
+        cdf.rename(columns={k:v for k,v in rename.items() if k in cdf.columns},inplace=True)
+        st.dataframe(cdf,width="stretch",hide_index=True)
+
+    # ── Fallback traces ────────────────────────────────────────────────────
+    fallbacks = cva.get("fallback_traces",[])
+    if fallbacks:
+        sec(f"FALLBACK TRACES — {len(fallbacks)} COUNTERPART(IES) ON BA-CVA")
+        for trace in fallbacks[:20]:
+            parts = trace.split("|")
+            cpty_id = parts[1] if len(parts)>1 else trace
+            reason  = parts[2] if len(parts)>2 else "—"
+            detail  = parts[3] if len(parts)>3 else ""
+            st.markdown(
+                f'<div class="lrow" style="grid-template-columns:180px 120px 1fr">'                f'<div><div class="ln">{cpty_id}</div></div>'                f'<div class="kpi-tag t-warn">{reason}</div>'                f'<div class="lt">{detail}</div></div>',
+                unsafe_allow_html=True)
+    else:
+        st.success("All counterparties on SA-CVA — no fallbacks to BA-CVA.")
+
+    sec("REGULATORY CONTEXT — MAR50")
+    st.markdown("""
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-family:'Nunito Sans',sans-serif;font-size:0.83rem;color:var(--slate-600)">
+<div style="background:var(--white);border:1px solid var(--border);border-radius:10px;padding:14px 16px">
+<strong style="color:var(--slate-800)">SA-CVA (MAR50.40+)</strong><br>
+Requires supervisory approval · Sensitivity-based (like FRTB SBM) · Delta + Vega charges on credit spread sensitivities · Lower capital than BA-CVA for well-hedged books
+</div>
+<div style="background:var(--white);border:1px solid var(--border);border-radius:10px;padding:14px 16px">
+<strong style="color:var(--slate-800)">BA-CVA (MAR50.20–38)</strong><br>
+Always available as fallback · EAD × RW × M_eff · Supervisory rho = 50% (floor) · Hedge benefit capped · CCR proxy if aggregate CCR RWA below materiality threshold
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CCP EXPOSURE — CRE54
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "CCP Exposure":
+    st.markdown('<div class="page-title">CCP Exposure Capital</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-sub">CRE54 · QCCP / Non-QCCP · Trade Exposure · Default Fund</div>',
+                unsafe_allow_html=True)
+
+    positions = ccp.get("positions",[])
+    total_rwa_ccp = ccp.get("total_rwa_ccp",0)
+    qccp_count    = sum(1 for p in positions if p.get("is_qualifying"))
+    nonqccp_count = len(positions) - qccp_count
+    total_ead     = sum(p.get("trade_ead",0) for p in positions)
+    total_dfc     = sum(p.get("df_contribution",0) for p in positions)
+
+    c1,c2,c3,c4,c5 = st.columns(5)
+    kpi(c1,"Total CCP RWA",  fmt_bn(total_rwa_ccp),  "Aggregate CRE54 charge", "CRE54",      "t-blue")
+    kpi(c2,"QCCP Positions",  str(qccp_count),         "Qualifying CCPs",        "2% RW",       "t-ok")
+    kpi(c3,"Non-QCCP",        str(nonqccp_count),      "Non-qualifying CCPs",    "100% RW",     "t-bad" if nonqccp_count>0 else "t-ok")
+    kpi(c4,"Trade EAD",       fmt_bn(total_ead),        "Total cleared exposure", "SA-CCR based","t-stone")
+    kpi(c5,"Default Fund",    fmt_bn(total_dfc),        "DFC contributions",      "CRE54.31",   "t-stone")
+
+    sec("CCP POSITIONS — TRADE EXPOSURE AND DEFAULT FUND")
+    if positions:
+        fig_ccp = go.Figure()
+        ccp_names  = [p["ccp_name"] for p in positions]
+        rwa_trade  = [p["rwa_trade"]/1e6 for p in positions]
+        rwa_dfc    = [p["rwa_dfc"]/1e6   for p in positions]
+        fig_ccp.add_trace(go.Bar(name="Trade Exposure RWA",x=ccp_names,y=rwa_trade,
+            marker_color=C["blue"],opacity=0.85,
+            text=[f"${v:.1f}M" for v in rwa_trade],textposition="inside",
+            textfont=dict(family="JetBrains Mono",size=9,color="#fff")))
+        fig_ccp.add_trace(go.Bar(name="Default Fund RWA",x=ccp_names,y=rwa_dfc,
+            marker_color=C["amber"],opacity=0.85,
+            text=[f"${v:.1f}M" for v in rwa_dfc],textposition="inside",
+            textfont=dict(family="JetBrains Mono",size=9,color="#fff")))
+        fig_ccp.update_layout(**PLOT(300,10),barmode="stack",
+            yaxis_title="USD Millions",legend=LEG())
+        st.plotly_chart(fig_ccp)
+
+        # Detail table
+        rows = []
+        for p in positions:
+            rw_label = "2% (QCCP)" if p["is_qualifying"] else "100% (Non-QCCP)"
+            rows.append({
+                "CCP":              p["ccp_name"],
+                "Type":             "✓ QCCP" if p["is_qualifying"] else "✗ Non-QCCP",
+                "Trade EAD":        fmt_bn(p["trade_ead"]),
+                "IM Posted":        fmt_bn(p["im_posted"]),
+                "DFC":              fmt_bn(p["df_contribution"]),
+                "Trade RW":         rw_label,
+                "Trade RWA":        fmt_bn(p["rwa_trade"]),
+                "DFC RWA":          fmt_bn(p["rwa_dfc"]),
+                "Total RWA":        fmt_bn(p["rwa_total"]),
+                "Method":           p["method_note"],
+            })
+        st.dataframe(pd.DataFrame(rows),width="stretch",hide_index=True)
+
+    sec("REGULATORY CONTEXT — CRE54")
+    st.markdown("""
+<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;font-family:'Nunito Sans',sans-serif;font-size:0.82rem;color:var(--slate-600)">
+<div style="background:var(--white);border:1px solid var(--border);border-radius:10px;padding:14px 16px">
+<strong style="color:var(--slate-800)">Trade Exposure</strong><br>
+QCCP: 2% risk weight · Non-QCCP: 100% RW · Segregated IM: 0% RW (CRE54.15) · Non-segregated IM: 2% RW
+</div>
+<div style="background:var(--white);border:1px solid var(--border);border-radius:10px;padding:14px 16px">
+<strong style="color:var(--slate-800)">Default Fund</strong><br>
+Risk-sensitive: proportional to hypothetical KCCP (CRE54.32) · Simplified: DFC × 1.6% flat rate · Unfunded commitments: 1250% RW (CRE54.42)
+</div>
+<div style="background:var(--white);border:1px solid var(--border);border-radius:10px;padding:14px 16px">
+<strong style="color:var(--slate-800)">Client Clearing</strong><br>
+Clearing member acting as intermediary → 2% on client EAD · Exposure treated as trade-level QCCP exposure · No DFC for intermediary role
+</div>
+</div>
+""", unsafe_allow_html=True)
+
+
 elif page == "Reports":
     st.markdown('<div class="page-title">Reports</div>', unsafe_allow_html=True)
     st.markdown('<div class="page-sub">Regulatory Exports · xlsx · csv · Risk Control Use</div>',

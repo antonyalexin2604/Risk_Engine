@@ -96,6 +96,11 @@ AIRB  = AIRBConfig()
 FRTB  = FRTBConfig()
 MARKET_DATA = MarketDataConfig()
 
+import os as _os
+OPERATIONAL_RISK_ENABLED: bool = _os.getenv("PROMETHEUS_OP_RISK", "0") == "1"
+OPERATIONAL_RISK_BIA_FACTOR: float = 0.15
+OPERATIONAL_RISK_GROSS_INCOME: float = 0.0
+
 # ─── Misc ─────────────────────────────────────────────────────────────────────
 
 REPORT_OUTPUT_DIR = os.getenv("REPORT_DIR", "/tmp/prometheus_reports")
