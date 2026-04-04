@@ -30,6 +30,7 @@ from backend.engines.ccp     import compute_ccp_rwa
 
 from backend.data_generators.portfolio_generator import build_full_dataset
 from backend.data_generators.cva_generator      import build_cva_inputs, build_ccp_exposures
+from backend.data_sources.persistence           import ensure_schema, persist_run
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +50,7 @@ class PrometheusRunner:
         self.frtb     = FRTBEngine()
         self.cva      = CVAEngine(sa_cva_approved=sa_cva_approved)
         self.backtest = BacktestEngine()
+        self.db_ok    = ensure_schema()   # create tables if they don't exist
 
     def run_daily(self, run_date: date = None) -> Dict:
         run_date = run_date or date.today()
@@ -272,6 +274,16 @@ class PrometheusRunner:
                     "(floor applied)" if floor_triggered else "")
         logger.info("  CET1 Ratio      : %6.2f%%", cet1_ratio * 100)
         logger.info("=" * 70)
+
+        # ── Persist snapshot to PostgreSQL for time-series views ───────────
+        # Adds trade objects to results so persistence can read MTM values
+        for p_data, p_src in zip(results["derivative"], dataset["derivative_portfolios"]):
+            p_data["trades"] = p_src["trades"]
+        if self.db_ok:
+            persist_run(run_date, results)
+        else:
+            logger.debug("DB unavailable — skipping snapshot persistence")
+
         return results
 
     def _generate_sensitivities(self, pid: str, trades) -> List[Sensitivity]:

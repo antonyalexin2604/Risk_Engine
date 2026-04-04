@@ -30,6 +30,7 @@ import logging
 import random
 import math
 from datetime import date, timedelta
+from backend.data_sources.market_state import compute_trade_mtm
 from typing import List, Dict, Tuple
 from dataclasses import dataclass, field
 
@@ -245,8 +246,27 @@ def create_derivative_portfolio(
     trades: List[Trade] = []
     for i, tmpl in enumerate(selected):
         notional = rng.uniform(*tmpl["notional_range"])
-        maturity = book_date + timedelta(days=int(tmpl["tenor_yr"] * 365))
-        mtm      = rng.uniform(-notional * 0.05, notional * 0.05)
+        # Trades were originated 30–180 days ago (portfolio seasoning).
+        # This ensures non-zero MTM since the market has moved since origination.
+        days_seasoned = rng.randint(30, 180)
+        trade_date_actual = book_date - timedelta(days=days_seasoned)
+        maturity = trade_date_actual + timedelta(days=int(tmpl["tenor_yr"] * 365))
+        # MTM from market state engine — realistic day-on-day variation
+        # Each trade gets a price consistent with actual market moves since trade_date.
+        # The market state is deterministic per date so reruns produce identical results.
+        _proto_trade_for_mtm = type('_T', (), {
+            'asset_class':  tmpl['asset'],
+            'notional':     notional,
+            'direction':    1,         # direction assigned below; use 1 for pricing
+            'trade_date':   trade_date_actual,
+            'maturity_date':maturity,
+            'notional_ccy': rng.choice(['USD','EUR','GBP','JPY','CHF']),
+            'hedging_set':  tmpl.get('asset','IR'),
+            'credit_quality': 'IG',
+        })()
+        mtm = compute_trade_mtm(_proto_trade_for_mtm, book_date)
+        # Cap at ±15% of notional — avoids extreme moves for newly traded books
+        mtm = max(min(mtm, notional * 0.15), -notional * 0.15)
         method   = tmpl["method"]
 
         # ~20% of IMM trades fall back to SA-CCR (req #9)
@@ -258,16 +278,24 @@ def create_derivative_portfolio(
                 f"|EXOTIC_PAYOFF|Exotic payoff structure — SA-CCR mandated"
             )
 
+        _direction = rng.choice([-1, 1])
+        _ccy       = rng.choice(["USD", "EUR", "GBP", "JPY", "CHF"])
+        # Re-price with correct direction now that we know it
+        _proto_trade_for_mtm.direction    = _direction
+        _proto_trade_for_mtm.notional_ccy = _ccy
+        mtm_final = compute_trade_mtm(_proto_trade_for_mtm, book_date)
+        mtm_final = max(min(mtm_final, notional * 0.15), -notional * 0.15)
+
         t = Trade(
             trade_id        = new_trade_id(portfolio_id, i+1),
             asset_class     = tmpl["asset"],
             instrument_type = tmpl["type"],
             notional        = notional,
-            notional_ccy    = rng.choice(["USD", "EUR", "GBP", "JPY", "CHF"]),
-            direction       = rng.choice([-1, 1]),
+            notional_ccy    = _ccy,
+            direction       = _direction,
             maturity_date   = maturity,
-            trade_date      = book_date,
-            current_mtm     = mtm,
+            trade_date      = trade_date_actual,
+            current_mtm     = mtm_final,
             saccr_method    = method,
             fallback_trace  = fallback_trace,
         )
@@ -354,7 +382,15 @@ def create_banking_book_portfolio(
     exposures: List[BankingBookExposure] = []
     for i, lt in enumerate(selected):
         ead       = rng.uniform(1e6, 200e6)
-        pd        = min(base_pd * lt["pd_mult"] * rng.uniform(0.5, 2.0), 0.30)
+        # PD incorporates macro stress level from market state
+        # VIX > 25 → mild stress; VIX > 40 → crisis (doubles PD)
+        from backend.data_sources.market_state import get_market_state as _gms
+        _ms     = _gms(book_date)
+        _vix    = _ms.vix()
+        _cs_hy  = _ms.credit_spread("HY")
+        _stress = min(max((_vix - 18.0) / 40.0 + (_cs_hy - 380.0) / 1200.0, 0.0), 1.0)
+        _pd_macro_mult = 1.0 + 1.5 * _stress   # up to 2.5× PD in crisis
+        pd        = min(base_pd * lt["pd_mult"] * rng.uniform(0.5, 2.0) * _pd_macro_mult, 0.30)
         maturity  = rng.uniform(1.0, 7.0)
         lgd       = lt["lgd"] * rng.uniform(0.85, 1.15)
         lgd       = max(min(lgd, 0.75), 0.10)

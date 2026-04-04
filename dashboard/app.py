@@ -17,6 +17,10 @@ import io
 from datetime import date
 
 from backend.main import PrometheusRunner
+from backend.data_sources.persistence import (
+    read_capital_history, read_rwa_by_month, read_rwa_by_year,
+    read_portfolio_trend, read_mtm_history_for_portfolio,
+)
 
 st.set_page_config(
     page_title="PROMETHEUS · Risk Intelligence",
@@ -297,6 +301,18 @@ def gauge(value, minimum, label):
 def load_data(d):
     return PrometheusRunner(sa_cva_approved=True).run_daily(date.fromisoformat(d))
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_history(days=90):
+    return read_capital_history(days)
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_rwa_by_month():
+    return read_rwa_by_month(years=2)
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_rwa_by_year():
+    return read_rwa_by_year()
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown('<div class="wordmark">⬡ PROMET<span>H</span>EUS</div>', unsafe_allow_html=True)
@@ -438,6 +454,56 @@ if page == "Capital Dashboard":
             f'CVA excluded from floor base · CAP10 FAQ1</span></div>',
             unsafe_allow_html=True)
 
+    # ── 90-day historical trends ───────────────────────────────────────────────
+    hist_df = load_history(90)
+    if not hist_df.empty:
+        hist_df["run_date"] = pd.to_datetime(hist_df["run_date"])
+        hist_df = hist_df.sort_values("run_date")
+        sec("RWA TREND — 90 TRADING DAYS")
+        fig_trend = go.Figure()
+        _rwa_series = [("rwa_credit","Credit",C["blue"]),("rwa_ccr","CCR",C["teal"]),
+                       ("rwa_market","Market",C["gold"]),("rwa_cva","CVA",C["amber"]),
+                       ("rwa_ccp","CCP",C["slate"])]
+        for col,label,colour in _rwa_series:
+            if col in hist_df.columns:
+                fig_trend.add_trace(go.Scatter(x=hist_df["run_date"],y=hist_df[col]/1e6,
+                    name=label,stackgroup="rwa",mode="none",fillcolor=colour,opacity=0.80))
+        if "rwa_total" in hist_df.columns:
+            fig_trend.add_trace(go.Scatter(x=hist_df["run_date"],y=hist_df["rwa_total"]/1e6,
+                name="Total",line=dict(color=C["crimson"],width=1.5,dash="dot")))
+        fig_trend.update_layout(**PLOT(320,10),yaxis_title="USD Millions",legend=LEG())
+        st.plotly_chart(fig_trend)
+        if "cet1_ratio" in hist_df.columns:
+            fig_c = go.Figure()
+            fig_c.add_trace(go.Scatter(x=hist_df["run_date"],y=hist_df["cet1_ratio"]*100,
+                name="CET1",line=dict(color=C["blue"],width=2),
+                fill="tozeroy",fillcolor="rgba(30,64,175,0.07)"))
+            fig_c.add_hline(y=4.5,line_dash="dash",line_color=C["red"],annotation_text="Min 4.5%")
+            fig_c.update_layout(**PLOT(200,10),yaxis_title="CET1 %",legend=LEG())
+            st.plotly_chart(fig_c)
+        sec("RWA BY YEAR / MONTH")
+        monthly = load_rwa_by_month()
+        if not monthly.empty:
+            _m = monthly.copy()
+            for c in ["avg_rwa_total","max_rwa_total"]:
+                if c in _m.columns: _m[c] = _m[c].apply(fmt_bn)
+            if "avg_cet1_ratio" in _m.columns:
+                _m["avg_cet1_ratio"] = _m["avg_cet1_ratio"].apply(lambda x: f"{float(x)*100:.2f}%")
+            _m.columns = [c.replace("_"," ").title() for c in _m.columns]
+            st.dataframe(_m, width="stretch", hide_index=True)
+        yearly = load_rwa_by_year()
+        if not yearly.empty:
+            _y = yearly.copy()
+            for c in ["avg_rwa_total","min_rwa_total","max_rwa_total"]:
+                if c in _y.columns: _y[c] = _y[c].apply(fmt_bn)
+            for c in ["avg_cet1_ratio","min_cet1_ratio"]:
+                if c in _y.columns: _y[c] = _y[c].apply(lambda x: f"{float(x)*100:.2f}%")
+            _y.columns = [c.replace("_"," ").title() for c in _y.columns]
+            sec("ANNUAL SUMMARY"); st.dataframe(_y, width="stretch", hide_index=True)
+    else:
+        sec("HISTORICAL TRENDS")
+        st.info("No historical data yet. Run the platform on multiple days to populate time-series.")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 2 · DERIVATIVE PORTFOLIOS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -485,6 +551,36 @@ elif page == "Derivative Portfolios":
         kpi(cb4,"EAD Reduction",  f"{csa_red:.1f}%",     "Gross→CSA benefit",     "MPOR scale: {:.3f}".format(mpor_s), "t-ok" if csa_red>20 else "t-warn")
         st.markdown("")
 
+    # ── MTM day-on-day ──────────────────────────────────────────────────────
+    _mtm_hist = read_mtm_history_for_portfolio(pid, days=7)
+    if not _mtm_hist.empty and len(_mtm_hist["run_date"].unique()) > 1:
+        sec("TRADE MTM — DAY-ON-DAY")
+        _mtm_hist["run_date"] = pd.to_datetime(_mtm_hist["run_date"])
+        _pivot = _mtm_hist.pivot_table(index="trade_id",columns="run_date",values="mtm",aggfunc="sum")
+        _pivot = _pivot.sort_index(axis=1)
+        if len(_pivot.columns) >= 2:
+            _ld,_pd_ = _pivot.columns[-1],_pivot.columns[-2]
+            _pivot["delta"] = _pivot[_ld] - _pivot[_pd_]
+            _disp = _pivot[[_ld,_pd_,"delta"]].reset_index()
+            _disp.columns = ["Trade",f"Today {_ld.date()}",f"Prior {_pd_.date()}","Δ MTM (1d)"]
+            for c in [f"Today {_ld.date()}",f"Prior {_pd_.date()}","Δ MTM (1d)"]:
+                _disp[c] = _disp[c].apply(fmt_bn)
+            st.dataframe(_disp, width="stretch", hide_index=True)
+    # ── EAD/RWA 30-day trend ─────────────────────────────────────────────────
+    _pt = read_portfolio_trend(pid, days=30)
+    if not _pt.empty and len(_pt) > 1:
+        sec("EAD / RWA / MTM — 30-DAY TREND")
+        _pt["run_date"] = pd.to_datetime(_pt["run_date"]); _pt = _pt.sort_values("run_date")
+        _fig = go.Figure()
+        _fig.add_trace(go.Scatter(x=_pt["run_date"],y=_pt["ead"]/1e6,name="EAD",
+            line=dict(color=C["blue"],width=2)))
+        _fig.add_trace(go.Scatter(x=_pt["run_date"],y=_pt["rwa"]/1e6,name="RWA",
+            line=dict(color=C["crimson"],width=2,dash="dot")))
+        if "mtm_net" in _pt.columns:
+            _fig.add_trace(go.Scatter(x=_pt["run_date"],y=_pt["mtm_net"]/1e6,name="Net MTM",
+                line=dict(color=C["teal"],width=1.5)))
+        _fig.update_layout(**PLOT(260,10),yaxis_title="USD Millions",legend=LEG())
+        st.plotly_chart(_fig)
     sec("ALL DERIVATIVE PORTFOLIOS")
     rows=[]
     for p in drv:
