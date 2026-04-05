@@ -196,12 +196,25 @@ def create_derivative_portfolio(
         {"asset": "EQ",    "type": "VarSwap",        "notional_range": (1e6,  10e6),   "method": "SA_CCR", "tenor_yr": 1.0,  "is_exotic": True},
         {"asset": "EQ",    "type": "EquityBarrier",  "notional_range": (3e6,  30e6),   "method": "SA_CCR", "tenor_yr": 1.0,  "is_exotic": True},
         {"asset": "EQ",    "type": "BasketOption",   "notional_range": (10e6, 80e6),   "method": "SA_CCR", "tenor_yr": 2.0,  "is_exotic": True},
-        # Credit — vanilla
-        {"asset": "CR",    "type": "CDS_Protection", "notional_range": (5e6,  100e6),  "method": "SA_CCR", "tenor_yr": 5.0,  "is_exotic": False},
-        {"asset": "CR",    "type": "TRS",            "notional_range": (10e6, 80e6),   "method": "IMM",    "tenor_yr": 3.0,  "is_exotic": False},
-        {"asset": "CR",    "type": "CDS_Index",      "notional_range": (20e6, 200e6),  "method": "SA_CCR", "tenor_yr": 5.0,  "is_exotic": False},
-        # Credit — exotic
-        {"asset": "CR",    "type": "CDO_Tranche",    "notional_range": (50e6, 500e6),  "method": "SA_CCR", "tenor_yr": 7.0,  "is_exotic": True},
+        # Credit — single-name (sub_hedging_set = "SINGLE_NAME")
+        {"asset": "CR", "type": "CDS_Protection", "credit_sub": "SINGLE_NAME",
+         "notional_range": (5e6, 100e6),  "method": "SA_CCR", "tenor_yr": 5.0, "is_exotic": False,
+         "ref_entities": ["Ford Motor Co", "General Electric", "AT&T Inc", "Occidental Petroleum",
+                          "Kraft Heinz Co", "Macy's Inc", "Community Health Systems"]},
+        {"asset": "CR", "type": "TRS",            "credit_sub": "SINGLE_NAME",
+         "notional_range": (10e6, 80e6),  "method": "IMM",    "tenor_yr": 3.0, "is_exotic": False,
+         "ref_entities": ["Tesla Inc", "Amazon.com Inc", "Apple Inc", "Microsoft Corp", "Alphabet Inc"]},
+        # Credit — non-tranched index CDS (sub_hedging_set = "INDEX_CDS")
+        {"asset": "CR", "type": "CDS_Index",      "credit_sub": "INDEX_CDS",
+         "notional_range": (20e6, 200e6), "method": "SA_CCR", "tenor_yr": 5.0, "is_exotic": False,
+         "ref_entities": ["CDX.NA.IG.41 5Y", "CDX.NA.IG.42 5Y", "iTraxx Europe S41 5Y"]},
+        {"asset": "CR", "type": "CDS_NonTranched", "credit_sub": "NON_TRANCHED",
+         "notional_range": (30e6, 250e6), "method": "SA_CCR", "tenor_yr": 5.0, "is_exotic": False,
+         "ref_entities": ["CDX.NA.HY.41 5Y", "iTraxx Crossover S41 5Y", "CDX.NA.IG.41 3Y"]},
+        # Credit — tranched CDS / CDO (sub_hedging_set = "TRANCHED" — exotic, SA-CCR fallback)
+        {"asset": "CR", "type": "CDO_Tranche",    "credit_sub": "TRANCHED",
+         "notional_range": (50e6, 500e6), "method": "SA_CCR", "tenor_yr": 7.0, "is_exotic": True,
+         "ref_entities": ["CDX.NA.IG.41 [0-3%]", "iTraxx Europe [3-6%]", "BESPOKE_CLO_MEZZ"]},
         # Commodity — vanilla
         {"asset": "CMDTY", "type": "CommodityFwd",   "notional_range": (1e6,  20e6),   "method": "SA_CCR", "tenor_yr": 1.0,  "is_exotic": False},
         {"asset": "CMDTY", "type": "CommoditySwap",  "notional_range": (5e6,  50e6),   "method": "SA_CCR", "tenor_yr": 2.0,  "is_exotic": False},
@@ -286,18 +299,53 @@ def create_derivative_portfolio(
         mtm_final = compute_trade_mtm(_proto_trade_for_mtm, book_date)
         mtm_final = max(min(mtm_final, notional * 0.15), -notional * 0.15)
 
+        # ── Underlying / reference entity ID ─────────────────────────────────
+        ac   = tmpl["asset"]
+        itype = tmpl["type"]
+        # EQ: use index / single-stock ticker
+        _eq_refs  = ["SPX Index","SX5E Index","NKY Index","AAPL US Equity",
+                     "MSFT US Equity","AMZN US Equity","TSLA US Equity"]
+        # CMDTY: commodity code
+        _cmd_refs = {"CMDTY_ENERGY":"WTI_CRUDE","CMDTY_METALS":"GOLD_SPOT","CMDTY_AGRI":"CORN_FRONT"}
+        # CR: reference entity list from template or generic
+        _cr_refs  = tmpl.get("ref_entities", ["Generic Corp"])
+
+        if ac == "EQ":
+            _uid = rng.choice(_eq_refs)
+        elif ac == "CR":
+            _uid = rng.choice(_cr_refs)
+        elif ac == "CMDTY":
+            _uid = _cmd_refs.get(tmpl.get("type","CMDTY_OTHER"), "CMDTY_OTHER")
+        else:
+            _uid = None   # IR and FX have no single underlying security
+
+        # ── Credit derivative fields ──────────────────────────────────────────
+        _credit_sub = tmpl.get("credit_sub", "SINGLE_NAME")
+        _ref_entity  = _uid if ac == "CR" else None
+
+        # ── Commodity type ────────────────────────────────────────────────────
+        _cmdty_type_map = {
+            "CommodityFwd": "CMDTY_ENERGY", "CommoditySwap": "CMDTY_ENERGY",
+            "CommodityOption": "CMDTY_ENERGY", "SpreadOption": "CMDTY_METALS",
+        }
+        _cmdty_type = _cmdty_type_map.get(itype, None) if ac == "CMDTY" else None
+
         t = Trade(
-            trade_id        = new_trade_id(portfolio_id, i+1),
-            asset_class     = tmpl["asset"],
-            instrument_type = tmpl["type"],
-            notional        = notional,
-            notional_ccy    = _ccy,
-            direction       = _direction,
-            maturity_date   = maturity,
-            trade_date      = trade_date_actual,
-            current_mtm     = mtm_final,
-            saccr_method    = method,
-            fallback_trace  = fallback_trace,
+            trade_id              = new_trade_id(portfolio_id, i+1),
+            asset_class           = ac,
+            instrument_type       = itype,
+            notional              = notional,
+            notional_ccy          = _ccy,
+            direction             = _direction,
+            maturity_date         = maturity,
+            trade_date            = trade_date_actual,
+            current_mtm           = mtm_final,
+            saccr_method          = method,
+            fallback_trace        = fallback_trace,
+            underlying_security_id= _uid,
+            reference_entity      = _ref_entity,
+            commodity_type        = _cmdty_type,
+            credit_sub_type       = _credit_sub,
         )
         trades.append(t)
 

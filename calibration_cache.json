@@ -1,5 +1,5 @@
 {
-  "calibration_date": "2026-04-04",
+  "calibration_date": "2026-04-05",
   "lookback_days": 252,
   "data_quality": "full",
   "eq_vol_hist": 0.1823805513335929,
@@ -25,12 +25,12 @@
   "cs_ig_vol": 0.3,
   "cs_hy_vol": 0.45,
   "vix_level": 23.8700008392334,
-  "cmdty_energy_vol": 0.8459108649572535,
-  "cmdty_metals_vol": 0.4105421770542923,
-  "cmdty_agri_vol": 0.16404587905388132,
-  "cmdty_energy_spot": 111.54000091552734,
-  "cmdty_metals_spot": 4651.5,
-  "cmdty_agri_spot": 452.25,
+  "cmdty_energy_vol": 0.8550347817711383,
+  "cmdty_metals_vol": 0.401390300445406,
+  "cmdty_agri_vol": 0.1642846807049197,
+  "cmdty_energy_spot": 112.05999755859375,
+  "cmdty_metals_spot": 4702.7001953125,
+  "cmdty_agri_spot": 452.0,
   "correlation_matrix": [
     [
       1.0,

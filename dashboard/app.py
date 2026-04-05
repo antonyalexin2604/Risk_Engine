@@ -330,6 +330,7 @@ with st.sidebar:
         "Market Risk (FRTB)", "IMM Exposure Profiles",
         "CVA Risk", "CCP Exposure",
         "Risk Limits", "Backtesting", "Reports",
+        "Market Calibration",
     ], label_visibility="collapsed")
 
     st.markdown("<br>", unsafe_allow_html=True)
@@ -582,6 +583,105 @@ elif page == "Derivative Portfolios":
                 line=dict(color=C["teal"],width=1.5)))
         _fig.update_layout(**PLOT(260,10),yaxis_title="USD Millions",legend=LEG())
         st.plotly_chart(_fig)
+    # ── SA-CCR Trade Attribution Table ───────────────────────────────────────
+    sec("SA-CCR TRADE ATTRIBUTION — FULL DECOMPOSITION")
+    st.caption(
+        "Complete trade-level SA-CCR breakdown: hedging set, sub-hedging set, "
+        "supervisory parameters, notional decomposition, and EAD / RWA allocation."
+    )
+
+    # Column ordering and rename map for the attribution table
+    _ATTR_COLS = [
+        ("portfolio_id",            "Portfolio ID"),
+        ("trade_id",                "Trade ID"),
+        ("asset_class",             "Asset Class"),
+        ("instrument_type",         "Instrument"),
+        ("underlying_security_id",  "Underlying / Security ID"),
+        ("notional_ccy",            "CCY"),
+        ("direction",               "Direction"),
+        ("current_mtm",             "Current MTM"),
+        ("rc_allocated",            "RC (Trade)"),
+        ("rc_portfolio",            "RC (Portfolio)"),
+        ("addon_trade",             "Add-On (Trade)"),
+        ("addon_portfolio",         "Add-On (Portfolio)"),
+        ("pfe_trade",               "PFE (Trade)"),
+        ("pfe_portfolio",           "PFE (Portfolio)"),
+        ("hedging_set",             "Hedging Set"),
+        ("sub_hedging_set",         "Sub-Hedging Set"),
+        ("supervisory_duration",    "Supervisory Duration"),
+        ("supervisory_factor",      "Supervisory Factor"),
+        ("maturity_factor",         "Maturity Factor"),
+        ("supervisory_delta",       "Supervisory Delta"),
+        ("sign_delta",              "Sign Delta"),
+        ("saccr_notional",          "SA-CCR Notional"),
+        ("saccr_adjusted_notional", "Adjusted Notional (SD×N)"),
+        ("effective_notional",      "Effective Notional"),
+        ("ead_trade",               "EAD (Trade)"),
+        ("ead_portfolio",           "EAD (Portfolio)"),
+        ("risk_weight_pct",         "Risk Weight (%)"),
+        ("rwa",                     "RWA"),
+        ("ead_calc_type",           "EAD Calc Type"),
+    ]
+    _MONEY_COLS = {
+        "current_mtm","rc_allocated","rc_portfolio","addon_trade","addon_portfolio",
+        "pfe_trade","pfe_portfolio","saccr_notional","saccr_adjusted_notional",
+        "effective_notional","ead_trade","ead_portfolio","rwa",
+    }
+    _PCT_COLS   = {"supervisory_factor","maturity_factor","risk_weight_pct"}
+    _DEC4_COLS  = {"supervisory_duration","supervisory_delta"}
+
+    attr_rows = []
+    # Gather trade_results from selected portfolio only
+    _tr = port["saccr"].get("trade_results", {})
+    for tid, tr in _tr.items():
+        row = {}
+        for key, label in _ATTR_COLS:
+            val = tr.get(key, "—")
+            if val is None:
+                val = "—"
+            elif key in _MONEY_COLS and isinstance(val, (int,float)):
+                val = fmt_bn(val)
+            elif key in _PCT_COLS and isinstance(val, (int,float)):
+                val = f"{val*100:.4f}%" if val < 1 else f"{val:.1f}%"
+            elif key in _DEC4_COLS and isinstance(val, (int,float)):
+                val = f"{val:.6f}"
+            row[label] = val
+        attr_rows.append(row)
+
+    if attr_rows:
+        _attr_df = pd.DataFrame(attr_rows)
+        # Colour-code EAD Calc Type column
+        def _style_calc_type(val):
+            if val == "IMM":     return "background-color:#e8f5e9;color:#1a5c2e;font-weight:bold"
+            if val == "FALLBACK":return "background-color:#fff3f3;color:#8b2500;font-weight:bold"
+            return "background-color:#ebf3fb;color:#2b5797;font-weight:bold"
+        styled = _attr_df.style.applymap(_style_calc_type, subset=["EAD Calc Type"])
+        st.dataframe(styled, width="stretch", hide_index=True)
+        # Download button
+        _csv = _attr_df.to_csv(index=False).encode()
+        st.download_button(
+            f"⬇  Download Attribution — {pid}",
+            _csv, f"saccr_attribution_{pid}.csv", "text/csv"
+        )
+    else:
+        st.info("No trade-level data available for this portfolio yet.")
+
+    # ── Hedging Set summary ──────────────────────────────────────────────────
+    sec("HEDGING SET SUMMARY")
+    _hs_rows = []
+    for tid, tr in _tr.items():
+        _hs_rows.append({
+            "Trade": tid,
+            "Asset Class": tr.get("asset_class",""),
+            "Instrument": tr.get("instrument_type",""),
+            "Hedging Set": tr.get("hedging_set",""),
+            "Sub-Hedging Set": tr.get("sub_hedging_set",""),
+            "Hedging Set Basis": tr.get("hedging_set_basis",""),
+            "EAD Calc Type": tr.get("ead_calc_type",""),
+        })
+    if _hs_rows:
+        st.dataframe(pd.DataFrame(_hs_rows), width="stretch", hide_index=True)
+
     sec("ALL DERIVATIVE PORTFOLIOS")
     rows=[]
     for p in drv:
@@ -862,22 +962,81 @@ elif page == "Backtesting":
         "Active":["← Active" if zone=="GREEN" else "","← Active" if zone=="AMBER" else "","← Active" if zone=="RED" else ""],
     }),width="stretch",hide_index=True)
 
-    sec("P&L vs VAR — 250 DAY LOOKBACK")
-    rng=np.random.default_rng(42)
-    days=list(range(1,251)); pnl=rng.normal(0,50000,250); var=np.abs(rng.normal(50000,10000,250))
-    exc_x=[d for d,p,v in zip(days,pnl,var) if -p>v]
-    exc_y=[pnl[d-1]/1e3 for d in exc_x]
+    sec("P&L vs VaR — 250 TRADING DAY LOOKBACK")
+
+    # Build P&L and VaR series from historical DB if available,
+    # else fall back to a deterministic simulation seeded from portfolio EAD
+    hist_df = load_history(250)
+    if not hist_df.empty and "rwa_market" in hist_df.columns and len(hist_df) >= 20:
+        # Use actual historical market RWA changes as a P&L proxy
+        # (daily RWA change × -1 approximates desk P&L direction)
+        hist_df = hist_df.sort_values("run_date")
+        rwa_series = hist_df["rwa_market"].values.astype(float)
+        n_hist = len(rwa_series)
+        # Daily P&L ≈ -ΔRWA / 12.5 (reverse RWA conversion)
+        pnl_hist = -np.diff(rwa_series, prepend=rwa_series[0]) / 12.5
+        # VaR ≈ 2.33 × rolling 20-day std of P&L
+        var_hist = np.array([
+            2.33 * np.std(pnl_hist[max(0,i-20):i+1])
+            for i in range(n_hist)
+        ])
+        days_hist = list(range(1, n_hist+1))
+        source_label = f"Historical ({n_hist} days from DB)"
+    else:
+        # Deterministic simulation seeded from current total EAD
+        ead_seed = int(sum(p["saccr"]["ead"] for p in drv) / 1e6) % 10000
+        rng2 = np.random.default_rng(ead_seed)
+        n_hist = 250
+        base_pnl_scale = sum(p["saccr"]["ead"] for p in drv) / 250.0 * 0.002
+        pnl_hist = rng2.normal(base_pnl_scale * 0.1, base_pnl_scale, n_hist)
+        var_hist  = np.abs(rng2.normal(base_pnl_scale * 0.8, base_pnl_scale * 0.1, n_hist))
+        days_hist = list(range(1, n_hist+1))
+        source_label = "Simulated (seed from portfolio EAD — populate DB for live data)"
+
+    exc_x = [d for d,p,v in zip(days_hist,pnl_hist,var_hist) if -p > v]
+    exc_y = [pnl_hist[d-1]/1e3 for d in exc_x]
+    actual_excepts = len(exc_x)
+
+    # Update zone based on actual simulated exceptions
+    _zone_actual = "GREEN" if actual_excepts<=4 else ("AMBER" if actual_excepts<=9 else "RED")
+
     fig_bt=go.Figure()
-    fig_bt.add_trace(go.Bar(x=days,y=pnl/1e3,name="Daily P&L",
-        marker_color=[C["red"] if p<0 else C["blue"] for p in pnl],opacity=0.60))
-    fig_bt.add_trace(go.Scatter(x=days,y=-var/1e3,name="−VaR Boundary",
+    fig_bt.add_trace(go.Bar(
+        x=days_hist, y=pnl_hist/1e3, name="Daily P&L",
+        marker_color=[C["red"] if p<0 else C["blue"] for p in pnl_hist],
+        opacity=0.60))
+    fig_bt.add_trace(go.Scatter(
+        x=days_hist, y=-var_hist/1e3, name="−VaR Boundary",
         line=dict(color=C["amber"],dash="dash",width=1.5)))
-    fig_bt.add_trace(go.Scatter(x=exc_x,y=exc_y,mode="markers",name="Exception",
-        marker=dict(color=C["red"],size=8,symbol="x-thin",line=dict(width=2,color=C["red"]))))
+    if exc_x:
+        fig_bt.add_trace(go.Scatter(
+            x=exc_x, y=exc_y, mode="markers", name=f"Exception ({actual_excepts})",
+            marker=dict(color=C["red"],size=9,symbol="x-thin",
+                        line=dict(width=2.5,color=C["red"]))))
     fig_bt.update_layout(**PLOT(400,10),
-        xaxis_title="Trading Day",yaxis_title="P&L (USD 000s)",
-        legend=LEG())
+        xaxis_title="Trading Day", yaxis_title="P&L (USD 000s)",
+        legend=LEG(),
+        title=dict(text=source_label,font=dict(size=11,color="#94a3b8"),x=0.02))
     st.plotly_chart(fig_bt)
+
+    # P&L distribution chart
+    sec("P&L DISTRIBUTION vs NORMAL")
+    fig_dist = go.Figure()
+    fig_dist.add_trace(go.Histogram(
+        x=pnl_hist/1e3, nbinsx=40, name="Observed P&L",
+        marker_color=C["blue"], opacity=0.70,
+        histnorm="probability density"))
+    # Overlay normal fit
+    _mu = float(np.mean(pnl_hist/1e3))
+    _sd = float(np.std(pnl_hist/1e3))
+    _x_norm = np.linspace(float(np.min(pnl_hist/1e3))*1.3, float(np.max(pnl_hist/1e3))*1.3, 200)
+    _y_norm = (1/(_sd*np.sqrt(2*np.pi))) * np.exp(-0.5*((_x_norm-_mu)/_sd)**2)
+    fig_dist.add_trace(go.Scatter(
+        x=_x_norm, y=_y_norm, name="Normal fit",
+        line=dict(color=C["amber"],width=2,dash="dot")))
+    fig_dist.update_layout(**PLOT(280,10),
+        xaxis_title="Daily P&L (USD 000s)", yaxis_title="Density", legend=LEG())
+    st.plotly_chart(fig_dist)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 8 · REPORTS
@@ -1069,66 +1228,320 @@ elif page == "Reports":
     c_l,c_r=st.columns([1,2])
     with c_l:
         sec("REPORT TYPE")
-        rtype=st.selectbox("",["Capital Summary (RBC20)","Derivative Portfolio — SA-CCR Detail",
-            "Banking Book — A-IRB Detail","FRTB Market Risk Summary","Full Daily Risk Pack"],
-            label_visibility="collapsed")
+        rtype=st.selectbox("",[
+            "Capital Summary (RBC20)",
+            "SA-CCR Trade Attribution (all 29 fields)",
+            "Derivative Portfolio — SA-CCR Summary",
+            "Banking Book — A-IRB Detail",
+            "CVA Detail — By Counterparty",
+            "CCP Exposure Detail",
+            "FRTB Market Risk Summary",
+            "Full Daily Risk Pack (multi-sheet Excel)",
+        ], label_visibility="collapsed")
         sec("FORMAT")
         fmt=st.radio("",["Excel (.xlsx)","CSV (.csv)"],label_visibility="collapsed")
         date_str=run_date.strftime("%Y%m%d")
     with c_r:
         st.markdown("<br><br>", unsafe_allow_html=True)
         if st.button("Generate Report"):
-            if "Capital" in rtype:
-                df_out=pd.DataFrame([{"Run Date":cap["run_date"],
-                    "RWA Credit":cap["rwa_credit"],"RWA CCR":cap["rwa_ccr"],
-                    "RWA Market":cap["rwa_market"],"RWA CVA":cap.get("rwa_cva",0),
-                    "RWA CCP":cap.get("rwa_ccp",0),"RWA Total":cap["rwa_total"],
-                    "CET1 Ratio (%)":cap["cet1_ratio"]*100,
-                    "Total Cap Ratio (%)":cap["total_cap_ratio"]*100,
-                    "Floor Triggered":cap["floor_triggered"],
-                    "CVA Method":cap.get("cva_method","")}])
-            elif "SA-CCR" in rtype:
+            # ── Helper: build SA-CCR attribution across all portfolios ────────
+            def _build_saccr_attribution():
+                rows=[]
+                for p in drv:
+                    for tid,tr in p["saccr"].get("trade_results",{}).items():
+                        rows.append({
+                            "Portfolio ID":          tr.get("portfolio_id",""),
+                            "Trade ID":              tr.get("trade_id",""),
+                            "Asset Class":           tr.get("asset_class",""),
+                            "Instrument Type":       tr.get("instrument_type",""),
+                            "Underlying / Sec ID":   tr.get("underlying_security_id","—") or "—",
+                            "Currency":              tr.get("notional_ccy",""),
+                            "Direction":             tr.get("direction",0),
+                            "Current MTM (USD)":     tr.get("current_mtm",0),
+                            "RC Allocated (USD)":    tr.get("rc_allocated",0),
+                            "RC Portfolio (USD)":    tr.get("rc_portfolio",0),
+                            "Add-On Trade (USD)":    tr.get("addon_trade",0),
+                            "Add-On Portfolio (USD)":tr.get("addon_portfolio",0),
+                            "PFE Trade (USD)":       tr.get("pfe_trade",0),
+                            "PFE Portfolio (USD)":   tr.get("pfe_portfolio",0),
+                            "Hedging Set":           tr.get("hedging_set",""),
+                            "Sub-Hedging Set":       tr.get("sub_hedging_set",""),
+                            "Hedging Set Basis":     tr.get("hedging_set_basis",""),
+                            "Supervisory Duration":  tr.get("supervisory_duration",0),
+                            "Supervisory Factor":    tr.get("supervisory_factor",0),
+                            "Maturity Factor":       tr.get("maturity_factor",0),
+                            "Supervisory Delta":     tr.get("supervisory_delta",0),
+                            "Sign Delta":            tr.get("sign_delta",0),
+                            "SA-CCR Notional":       tr.get("saccr_notional",0),
+                            "Adjusted Notional":     tr.get("saccr_adjusted_notional",0),
+                            "Effective Notional":    tr.get("effective_notional",0),
+                            "EAD (Trade)":           tr.get("ead_trade",0),
+                            "EAD (Portfolio)":       tr.get("ead_portfolio",0),
+                            "Risk Weight (%)":       tr.get("risk_weight_pct",0),
+                            "RWA (USD)":             tr.get("rwa",0),
+                            "EAD Calc Type":         tr.get("ead_calc_type","SA_CCR"),
+                            "Fallback Trace":        tr.get("fallback_trace","") or "",
+                            "Trade Date":            tr.get("trade_date",""),
+                            "Maturity Date":         tr.get("maturity_date",""),
+                            "Credit Quality":        tr.get("credit_quality",""),
+                        })
+                return pd.DataFrame(rows)
+
+            multi_sheet = False
+
+            if "SA-CCR Trade Attribution" in rtype:
+                df_out = _build_saccr_attribution()
+
+            elif "SA-CCR Summary" in rtype:
                 rows=[]
                 for p in drv:
                     s=p["saccr"]
                     rows.append({"Portfolio":p["portfolio_id"],"Counterparty":p["counterparty"],
-                                 "Trades":p["trade_count"],"Notional":p["gross_notional"],
-                                 "RC":s["rc"],"PFE Mult":s["pfe_mult"],"AddOn IR":s["addon_ir"],
-                                 "AddOn FX":s["addon_fx"],"AddOn Credit":s["addon_credit"],
-                                 "AddOn Equity":s["addon_equity"],"AddOn Comm":s["addon_commodity"],
-                                 "AddOn Total":s["addon_agg"],"EAD":s["ead"],"CCR RWA":p["rwa_ccr"]})
+                                 "Trades":p["trade_count"],"Notional (USD)":p["gross_notional"],
+                                 "RC (USD)":s["rc"],"PFE Mult":s["pfe_mult"],
+                                 "AddOn IR":s["addon_ir"],"AddOn FX":s["addon_fx"],
+                                 "AddOn Credit":s["addon_credit"],"AddOn Equity":s["addon_equity"],
+                                 "AddOn Commodity":s["addon_commodity"],"AddOn Total":s["addon_agg"],
+                                 "EAD (USD)":s["ead"],"CCR RWA (USD)":p["rwa_ccr"]})
                 df_out=pd.DataFrame(rows)
+
             elif "A-IRB" in rtype:
                 rows=[]
                 for p in bbk:
                     for t in p["airb_trades"]:
                         rows.append({"Portfolio":p["portfolio_id"],"Counterparty":p["counterparty"],
-                                     "Trade ID":t["trade_id"],"PD (%)":t["pd"]*100,"LGD (%)":t["lgd"]*100,
-                                     "EAD":t["ead"],"Corr R":t["correlation"],"Capital K":t["capital_k"],
-                                     "RWA":t["rwa"],"EL":t["el"]})
-                df_out=pd.DataFrame(rows)
-            else:
-                rows=[]
-                for p in drv: rows.append({"Portfolio":p["portfolio_id"],"Type":"DERIVATIVE",
-                    "EAD":p["saccr"]["ead"],"CCR RWA":p["rwa_ccr"],"Market RWA":p["rwa_market"]})
-                for p in bbk: rows.append({"Portfolio":p["portfolio_id"],"Type":"BANKING_BOOK",
-                    "EAD":p["total_ead"],"Credit RWA":p["total_rwa"]})
+                                     "Trade ID":t["trade_id"],"PD (%)":round(t["pd"]*100,4),
+                                     "LGD (%)":round(t["lgd"]*100,2),"EAD (USD)":t["ead"],
+                                     "Correlation R":t["correlation"],"Capital K":t["capital_k"],
+                                     "RWA (USD)":t["rwa"],"EL (USD)":t["el"]})
                 df_out=pd.DataFrame(rows)
 
-            if "Excel" in fmt:
+            elif "CVA Detail" in rtype:
+                rows=[]
+                for cpty in cva.get("counterparties",[]):
+                    rows.append({"Counterparty":cpty.get("counterparty_id",""),
+                                 "CVA Method":cpty.get("method",""),
+                                 "CVA RWA (USD)":cpty.get("rwa_cva",0),
+                                 "CVA Estimate (USD)":cpty.get("cva_estimate",0),
+                                 "Hedged":cpty.get("has_hedge",False),
+                                 "Fallback Trace":cpty.get("fallback_trace","") or ""})
+                df_out=pd.DataFrame(rows) if rows else pd.DataFrame({"Note":["No CVA counterparty data"]})
+
+            elif "CCP" in rtype:
+                rows=[]
+                for pos in ccp.get("positions",[]):
+                    rows.append({"CCP":pos["ccp_name"],
+                                 "Qualifying":pos["is_qualifying"],
+                                 "Trade EAD (USD)":pos["trade_ead"],
+                                 "IM Posted (USD)":pos["im_posted"],
+                                 "DFC (USD)":pos["df_contribution"],
+                                 "Trade RW":pos["trade_rw"],
+                                 "Trade RWA (USD)":pos["rwa_trade"],
+                                 "DFC RWA (USD)":pos["rwa_dfc"],
+                                 "Total RWA (USD)":pos["rwa_total"],
+                                 "Method":pos["method_note"]})
+                df_out=pd.DataFrame(rows) if rows else pd.DataFrame({"Note":["No CCP data"]})
+
+            elif "FRTB" in rtype:
+                rows=[]
+                for p in drv:
+                    frtb=p.get("frtb",{})
+                    rows.append({"Portfolio":p["portfolio_id"],"Counterparty":p["counterparty"],
+                                 "SBM Delta":frtb.get("sbm_delta",0),"SBM Vega":frtb.get("sbm_vega",0),
+                                 "SBM Curvature":frtb.get("sbm_curvature",0),
+                                 "SBM Total":frtb.get("sbm_total",0),
+                                 "IMA ES (10d)":frtb.get("es_10d",0),
+                                 "IMA Total":frtb.get("ima_total",0),
+                                 "Market Risk Capital":frtb.get("capital",0),
+                                 "Market RWA":frtb.get("rwa_market",0)})
+                df_out=pd.DataFrame(rows)
+
+            elif "Full Daily Risk Pack" in rtype:
+                multi_sheet = True
+                _sheets = {
+                    "Capital Summary":   pd.DataFrame([{
+                        "Run Date":cap["run_date"],"RWA Credit":cap["rwa_credit"],
+                        "RWA CCR":cap["rwa_ccr"],"RWA Market":cap["rwa_market"],
+                        "RWA CVA":cap.get("rwa_cva",0),"RWA CCP":cap.get("rwa_ccp",0),
+                        "RWA Total":cap["rwa_total"],"Floor Triggered":cap["floor_triggered"],
+                        "CET1 Ratio (%)":cap["cet1_ratio"]*100,
+                        "Tier1 Ratio (%)":cap["tier1_ratio"]*100,
+                        "Total Cap Ratio (%)":cap["total_cap_ratio"]*100,
+                        "CVA Method":cap.get("cva_method","")}]),
+                    "SA-CCR Attribution": _build_saccr_attribution(),
+                    "A-IRB Detail":      pd.DataFrame([
+                        {"Portfolio":p["portfolio_id"],"Counterparty":p["counterparty"],
+                         "Trade ID":t["trade_id"],"PD (%)":round(t["pd"]*100,4),
+                         "LGD (%)":round(t["lgd"]*100,2),"EAD":t["ead"],
+                         "Corr R":t["correlation"],"Capital K":t["capital_k"],
+                         "RWA":t["rwa"],"EL":t["el"]}
+                        for p in bbk for t in p["airb_trades"]]),
+                    "CVA Detail":        pd.DataFrame([
+                        {"Counterparty":c.get("counterparty_id",""),
+                         "Method":c.get("method",""),"CVA RWA":c.get("rwa_cva",0),
+                         "CVA Estimate":c.get("cva_estimate",0),
+                         "Hedged":c.get("has_hedge",False),
+                         "Fallback":c.get("fallback_trace","") or ""}
+                        for c in cva.get("counterparties",[])]),
+                    "CCP Detail":        pd.DataFrame([
+                        {"CCP":pos["ccp_name"],"QCCP":pos["is_qualifying"],
+                         "Trade EAD":pos["trade_ead"],"IM Posted":pos["im_posted"],
+                         "DFC":pos["df_contribution"],"Trade RW":pos["trade_rw"],
+                         "Trade RWA":pos["rwa_trade"],"DFC RWA":pos["rwa_dfc"],
+                         "Total RWA":pos["rwa_total"]}
+                        for pos in ccp.get("positions",[])]),
+                }
+                df_out = _sheets["Capital Summary"]   # for preview
+            else:
+                df_out=pd.DataFrame({"Note":["Select a report type and click Generate"]})
+
+            # ── Write output ──────────────────────────────────────────────────
+            if "Excel" in fmt or multi_sheet:
                 buf=io.BytesIO()
-                with pd.ExcelWriter(buf,engine="xlsxwriter") as w:
-                    df_out.to_excel(w,index=False,sheet_name="Risk Report")
-                    w.sheets["Risk Report"].set_column(0,len(df_out.columns)-1,20)
+                with pd.ExcelWriter(buf, engine="xlsxwriter") as w:
+                    if multi_sheet:
+                        for sheet_name, sheet_df in _sheets.items():
+                            sheet_df.to_excel(w, index=False, sheet_name=sheet_name[:31])
+                            ws = w.sheets[sheet_name[:31]]
+                            ws.set_column(0, len(sheet_df.columns)-1, 20)
+                            # Freeze top row
+                            ws.freeze_panes(1, 0)
+                            # Header format
+                            hdr_fmt = w.book.add_format(
+                                {"bold":True,"bg_color":"#1E3A5F","font_color":"#FFFFFF",
+                                 "border":1,"font_name":"Arial","font_size":10})
+                            for ci, col in enumerate(sheet_df.columns):
+                                ws.write(0, ci, col, hdr_fmt)
+                    else:
+                        df_out.to_excel(w, index=False, sheet_name="Risk Report")
+                        ws=w.sheets["Risk Report"]
+                        ws.set_column(0, len(df_out.columns)-1, 20)
+                        ws.freeze_panes(1, 0)
+                        hdr_fmt = w.book.add_format(
+                            {"bold":True,"bg_color":"#1E3A5F","font_color":"#FFFFFF",
+                             "border":1,"font_name":"Arial","font_size":10})
+                        for ci, col in enumerate(df_out.columns):
+                            ws.write(0, ci, col, hdr_fmt)
                 buf.seek(0)
                 fname=f"PROMETHEUS_{date_str}.xlsx"
-                st.download_button("⬇  Download Excel",buf,fname,
+                st.download_button("⬇  Download Excel", buf, fname,
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             else:
                 fname=f"PROMETHEUS_{date_str}.csv"
-                st.download_button("⬇  Download CSV",df_out.to_csv(index=False).encode(),fname,"text/csv")
+                st.download_button("⬇  Download CSV", df_out.to_csv(index=False).encode(),
+                    fname, "text/csv")
+
             sec("PREVIEW")
-            st.dataframe(df_out,width="stretch",hide_index=True)
+            st.dataframe(df_out, width="stretch", hide_index=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKET CALIBRATION
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Market Calibration":
+    st.markdown('<div class="page-title">Market Calibration</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-sub">Live Parameters · yfinance · Replaces Hardcoded Scalars</div>',
+                unsafe_allow_html=True)
+
+    @st.cache_data(ttl=3600, show_spinner=False)
+    def _load_cal():
+        try:
+            from backend.data_sources.calibration import CalibratedParams, _DEFAULT_CACHE_PATH
+            import os
+            if os.path.exists(_DEFAULT_CACHE_PATH):
+                return CalibratedParams.load(_DEFAULT_CACHE_PATH)
+            # Fallback: return defaults
+            return CalibratedParams(calibration_date="not-calibrated", data_quality="fallback")
+        except Exception as e:
+            return None
+
+    cal = _load_cal()
+
+    if cal is None:
+        st.warning("Calibration unavailable. Ensure yfinance is installed: pip install yfinance")
+    else:
+        qual_tag = {"full":"t-ok","partial":"t-warn","fallback":"t-bad","skipped":"t-stone"}.get(
+            cal.data_quality, "t-stone")
+        c1,c2,c3,c4,c5 = st.columns(5)
+        kpi(c1,"As Of",      cal.calibration_date,              "Calibration date",   cal.data_quality, qual_tag)
+        kpi(c2,"S&P 500",    f"{cal.eq_spot:,.0f}",             "Last close",         "EQ_US",          "t-stone")
+        kpi(c3,"Equity Vol", f"{cal.eq_vol_ewma*100:.2f}%",     "EWMA conditional",   "was 20.00%",     qual_tag)
+        kpi(c4,"10Y Rate",   f"{cal.ir_spot_10y*100:.3f}%",     "UST 10Y yield",      "IR_10Y",         "t-stone")
+        kpi(c5,"VIX",        f"{cal.vix_level:.1f}",            "CBOE VIX",           "Stress indicator",
+            "t-ok" if cal.vix_level<25 else ("t-warn" if cal.vix_level<40 else "t-bad"))
+
+        sec("EQUITY PARAMETERS — S&P 500 DERIVED")
+        e1,e2,e3,e4 = st.columns(4)
+        kpi(e1,"Hist Vol (1Y)",  f"{cal.eq_vol_hist*100:.2f}%",     "252-day realised",    "was 20.00%",  "t-blue")
+        kpi(e2,"EWMA Vol",       f"{cal.eq_vol_ewma*100:.2f}%",     "λ=0.94 conditional",  "IMM input",   "t-blue")
+        kpi(e3,"Stressed Vol",   f"{cal.eq_vol_stressed*100:.2f}%", "Worst 21d window",    "was 40.00%",  "t-warn")
+        kpi(e4,"Annual Drift",   f"{cal.eq_drift*100:+.2f}%",       "Log-return mean×252", "was +5.00%",
+            "t-ok" if cal.eq_drift>0 else "t-bad")
+
+        sec("INTEREST RATE PARAMETERS — ORNSTEIN-UHLENBECK MLE (UST 10Y)")
+        r1,r2,r3,r4 = st.columns(4)
+        kpi(r1,"OU Kappa (κ)",  f"{cal.ir_kappa:.4f}",         "Mean reversion speed",  "was 0.1000",  "t-blue")
+        kpi(r2,"OU Theta (θ)",  f"{cal.ir_theta_10y*100:.3f}%","Long-run target rate",  "was 4.500%",  "t-blue")
+        kpi(r3,"IR Vol",         f"{cal.ir_vol_hist*100:.4f}%", "Daily rate std×√252",   "was 1.500%",  "t-stone")
+        kpi(r4,"IR Stressed",    f"{cal.ir_vol_stressed*100:.4f}%","Worst 21d window",   "was 3.000%",  "t-warn")
+
+        sec("FX & COMMODITY CALIBRATION")
+        f1,f2,f3,f4 = st.columns(4)
+        kpi(f1,"EUR/USD Vol", f"{cal.fx_vol_eur*100:.2f}%",
+            "EWMA", f"Spot {cal.fx_spot_eur:.4f}", "t-stone")
+        kpi(f2,"GBP/USD Vol", f"{cal.fx_vol_gbp*100:.2f}%",
+            "EWMA", f"Spot {cal.fx_spot_gbp:.4f}", "t-stone")
+        kpi(f3,"Energy Vol",  f"{cal.cmdty_energy_vol*100:.2f}%",
+            "EWMA crude oil", f"Spot {cal.cmdty_energy_spot:.1f}", "t-stone")
+        kpi(f4,"Metals Vol",  f"{cal.cmdty_metals_vol*100:.2f}%",
+            "EWMA gold", f"Spot {cal.cmdty_metals_spot:.1f}", "t-stone")
+
+        sec("PARAMETER COMPARISON — LIVE vs HARDCODED")
+        _comp = pd.DataFrame([
+            {"Parameter": "Equity drift (μ)",     "Hardcoded": "+5.00%",
+             "Calibrated": f"{cal.eq_drift*100:+.2f}%",       "Source": "S&P 500 252d log-return mean"},
+            {"Parameter": "Equity vol (σ)",        "Hardcoded": "20.00%",
+             "Calibrated": f"{cal.eq_vol_ewma*100:.2f}%",     "Source": "EWMA conditional (λ=0.94)"},
+            {"Parameter": "Stressed vol",           "Hardcoded": "40.00%",
+             "Calibrated": f"{cal.eq_vol_stressed*100:.2f}%", "Source": "Worst 21-day rolling window"},
+            {"Parameter": "IR vol (σ_r)",           "Hardcoded": "1.5000%",
+             "Calibrated": f"{cal.ir_vol_hist*100:.4f}%",     "Source": "OU MLE on UST 10Y yield changes"},
+            {"Parameter": "Mean reversion (κ)",     "Hardcoded": "0.1000",
+             "Calibrated": f"{cal.ir_kappa:.4f}",             "Source": "OU MLE regression Δr = a+b×r+ε"},
+            {"Parameter": "Long-run rate (θ)",      "Hardcoded": "4.500%",
+             "Calibrated": f"{cal.ir_theta_10y*100:.3f}%",    "Source": "θ = -a/b from OLS regression"},
+            {"Parameter": "EUR/USD vol",            "Hardcoded": "8.00%",
+             "Calibrated": f"{cal.fx_vol_eur*100:.2f}%",      "Source": "EWMA on EURUSD daily returns"},
+            {"Parameter": "Energy commodity vol",   "Hardcoded": "30.00%",
+             "Calibrated": f"{cal.cmdty_energy_vol*100:.2f}%","Source": "EWMA on WTI crude CL=F"},
+        ])
+        st.dataframe(_comp, width="stretch", hide_index=True)
+
+        sec("CROSS-ASSET CORRELATION MATRIX — EWMA PAIRWISE (λ=0.94)")
+        _labels = ["EQ","FX","IR","CR","CMDTY","Market"]
+        _mat    = cal.correlation_matrix
+        fig_corr = go.Figure(go.Heatmap(
+            z=_mat, x=_labels, y=_labels,
+            colorscale=[[0,"#1e40af"],[0.5,"#f7f6f3"],[1,"#991b1b"]],
+            zmin=-1, zmax=1,
+            text=[[f"{v:.2f}" for v in row] for row in _mat],
+            texttemplate="%{text}",
+            textfont=dict(family="JetBrains Mono",size=11),
+            showscale=True,
+        ))
+        fig_corr.update_layout(**PLOT(380,10))
+        st.plotly_chart(fig_corr)
+
+        if cal.fetch_log:
+            sec("DATA FETCH LOG")
+            _log_df = pd.DataFrame([{"Factor":k,"Status":v} for k,v in cal.fetch_log.items()])
+            st.dataframe(_log_df, width="stretch", hide_index=True)
+
+        st.caption(
+            "Calibration refreshes every 8 hours (JSON cache). Live data via yfinance. "
+            "Falls back to hardcoded defaults per ticker on any fetch failure. "
+            "Correlations via EWMA (λ=0.94, RiskMetrics standard). "
+            "Skip calibration in CI: PROMETHEUS_SKIP_CALIBRATION=1."
+        )
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
 st.markdown(

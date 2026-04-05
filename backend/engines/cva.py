@@ -6,12 +6,49 @@ Regulatory basis: MAR50 (effective Jan 2023), RBC20.9(2), RBC25, CRE51.14
 Implements:
   - SA-CVA (Standardised): sensitivity-based, requires supervisory approval
   - BA-CVA (Basic): EAD-based, always available as fallback
+    - Reduced version (MAR50.14): no hedge recognition — always computed
+    - Full version (MAR50.20-21): hedge recognition via SNH / IH / HMA structure
   - Materiality threshold: < threshold → 100% of CCR RWA as proxy (MAR50.9)
   - Fallback trace code per requirement #13
   - CVA hedge removal from market risk (RBC25.30)
 
 CVA RWA feeds into Total RWA as a distinct line item under Market Risk (RBC20.9).
 CVA RWA is NOT included in the output floor base (CAP10 FAQ1).
+
+Regulatory Review — Corrections applied (April 2026)
+═══════════════════════════════════════════════════════════════════════════════
+FIX-01 [HIGH]   MAR50.14   Discount scalar DS=0.65 added to BA-CVA. Capital was
+                            previously overstated by ~54% for all BA-CVA exposures.
+
+FIX-02 [HIGH]   MAR50.21   BA-CVA hedge reduction completely rewritten. Previous
+                            formula (0.50 × notional × spread) had no MAR50 basis.
+                            Now implements correct SNH_c / IH / HMA_c structure with
+                            supervisory correlation ρ_hc (Table 2: 100%/80%/50%),
+                            β=0.25 floor, and reduced/full version split.
+
+FIX-03 [HIGH]   MAR50.29   supervisory_rho() corrected. Basel fixes ρ=0.50
+                            unconditionally. Dynamic VIX-based scaling (0.50→0.80)
+                            relocated to stress_rho() and gated behind regulatory=False.
+
+FIX-04 [MEDIUM] MAR50.9    Materiality threshold corrected from USD 1M CCR RWA to
+                            EUR 100bn aggregate notional. Threshold comparison now
+                            checks total_notional_eur, not CCR RWA.
+
+FIX-05 [MEDIUM] MAR50.65   SA-CVA risk weights corrected. Previous code selected RW
+                            by pd_1yr < 0.02 threshold. Now uses 8-bucket sector
+                            structure per MAR50.63 Table 5 / Table 7. Market-based
+                            ig_ratio/hy_ratio scaling removed (no MAR50 basis).
+
+FIX-06 [MEDIUM] MAR50.48   Vega charge: added note that vega must always be computed
+                            (MAR50.48 is explicit). Production hook provided.
+
+FIX-07 [MEDIUM] MAR50.15   CVAInput gains netting_sets list so SCVA can sum across
+                            all netting sets per counterparty.
+
+FIX-08 [LOW]    MAR50.32   Wrong-Way Risk flag and exposure add-on added to CVAInput.
+
+FIX-09 [LOW]    MAR50.32   Illiquid counterparty proxy spread function added with
+                            sector+rating+region mapping per MAR50.32(3).
 """
 
 from __future__ import annotations
@@ -53,13 +90,32 @@ class CVAMarketConditions:
 
     def supervisory_rho(self) -> float:
         """
-        MAR50.29 sets rho=0.50 as a floor; stress increases it
-        (diversification breakdown during crises, consistent with FRTB approach).
+        MAR50.14 paragraph (2) and MAR50.29: ρ = 0.50 is fixed by Basel.
+        It is a supervisory parameter, not a bank-estimated parameter.
+        Previous implementation incorrectly scaled ρ from 0.50 to 0.80
+        based on VIX — this has no MAR50 basis and must not be used for
+        regulatory capital.
+
+        Returns exactly 0.50 for all market conditions.
+        """
+        return 0.50  # MAR50.14(2): "ρ = 50%. It is the supervisory correlation parameter."
+
+    def stress_rho(self) -> float:
+        """
+        Internal / Pillar 2 stress rho — NOT for regulatory capital.
+
+        Scales ρ from 0.50 (normal) to 0.80 (crisis) based on live
+        market stress indicators. Use for:
+          - Pillar 2 ICAAP stress testing
+          - Internal CVA desk limit monitoring
+          - Scenario analysis on the CVA Risk dashboard page
+
+        NEVER pass this to compute_ba_cva() or compute_sa_cva() for
+        regulatory capital. Use supervisory_rho() = 0.50 there.
         """
         vix_norm = min(self.vix_level / 80.0, 1.0)
         hy_norm  = min((self.credit_spread_hy - 300) / 1200.0, 1.0)
         stress   = 0.60 * vix_norm + 0.40 * max(hy_norm, 0.0)
-        # Rho scales from 0.50 (normal) up to 0.80 (crisis)
         return min(0.50 + 0.30 * stress, 0.80)
 
     def lgd_for_sector(self, sector: str) -> float:
@@ -244,21 +300,107 @@ CVA_FALLBACK_REASONS: Dict[str, str] = {
 # ─── Data Structures ──────────────────────────────────────────────────────────
 
 @dataclass
+class NettingSetEAD:
+    """
+    Per-netting-set EAD and maturity for SCVA calculation.
+    MAR50.15 requires summing SCVA across all netting sets per counterparty.
+    A counterparty with a collateralised and an uncollateralised netting set
+    has different M_eff per netting set.
+    """
+    netting_set_id: str
+    ead:            float   # EAD from SA-CCR or IMM for this netting set
+    maturity_years: float   # Effective maturity for this netting set
+
+
+# MAR50.63 Table 5: Sector buckets for counterparty credit spread delta risk
+# Used by SA-CVA to select the correct risk weight from MAR50.65 Table 7.
+SECTOR_BUCKET: Dict[str, int] = {
+    "Sovereign":    1,   # Sovereigns, central banks, multilateral dev banks
+    "Muni":         1,   # Local government / gov-backed non-financials
+    "Financials":   2,   # Financials including gov-backed financials
+    "Energy":       3,   # Basic materials, energy, industrials, agriculture
+    "Industrials":  3,
+    "Consumer":     4,   # Consumer goods/services, transportation, admin
+    "Technology":   5,   # Technology, telecommunications
+    "Healthcare":   6,   # Health care, utilities, professional services
+    "Utilities":    6,
+    "Other":        7,   # Other sector
+    "default":      7,   # Fallback to bucket 7 (most conservative for unclassified)
+}
+
+# MAR50.65 Table 7: RWs by bucket and credit quality (IG / HY/NR)
+# Bucket 8 = Qualified Indices (optional treatment per MAR50.50)
+_SA_CVA_RW_IG: Dict[int, float] = {
+    1: 0.005,   # Sovereign IG:    0.5%  (bucket 1a); 1.0% for bucket 1b — use 0.5% as floor
+    2: 0.010,   # Financials IG:   1.0%
+    3: 0.030,   # Industrials IG:  3.0%
+    4: 0.030,   # Consumer IG:     3.0%
+    5: 0.020,   # Technology IG:   2.0%
+    6: 0.015,   # Healthcare IG:   1.5%
+    7: 0.050,   # Other IG:        5.0%
+    8: 0.015,   # Qualified Index IG: 1.5%
+}
+_SA_CVA_RW_HY: Dict[int, float] = {
+    1: 0.020,   # Sovereign HY:    2.0%
+    2: 0.040,   # Financials HY:   4.0%  (bucket 1b HY = 4.0%)
+    3: 0.070,   # Industrials HY:  7.0%
+    4: 0.085,   # Consumer HY:     8.5%
+    5: 0.055,   # Technology HY:   5.5%
+    6: 0.050,   # Healthcare HY:   5.0%
+    7: 0.120,   # Other HY:       12.0%
+    8: 0.050,   # Qualified Index HY: 5.0%
+}
+
+# MAR50.26 Table 2: Supervisory correlations between counterparty and single-name hedge
+# Used in full BA-CVA SNH calculation
+HEDGE_CORRELATION: Dict[str, float] = {
+    "DIRECT":           1.00,   # Hedge references counterparty c directly
+    "LEGALLY_RELATED":  0.80,   # Reference entity legally related to c (parent/subsidiary)
+    "SAME_SECTOR":      0.50,   # Reference entity same sector and region as c
+}
+
+# MAR50.20: discount scalar DS applied to full and reduced BA-CVA
+DS: float = 0.65
+
+# MAR50.20: β = supervisory parameter flooring hedging recognition
+BETA: float = 0.25
+
+
+@dataclass
 class CVAInput:
-    """Per-counterparty CVA inputs."""
+    """
+    Per-counterparty CVA inputs.
+
+    For counterparties with multiple netting sets, populate the
+    netting_sets list (one NettingSetEAD per netting set). The
+    main ead and maturity_years fields will be overridden by the
+    netting-set-level computation when netting_sets is non-empty.
+    """
     counterparty_id:    str
     netting_set_id:     str
-    ead:                float         # EAD from SA-CCR or IMM
+    ead:                float         # EAD from SA-CCR or IMM (single netting set)
     pd_1yr:             float         # 1-year PD of counterparty
-    lgd_mkt:            float = 0.40  # Market LGD — overridden by CVAMarketConditions if available
-    maturity_years:     float = 2.5   # Effective maturity of netting set
+    lgd_mkt:            float = 0.40  # Market LGD — overridden by CVAMarketConditions
+    maturity_years:     float = 2.5   # Effective maturity (single netting set)
     discount_factor:    float = 1.0   # Risk-free discount
     credit_spread_bps:  Optional[float] = None  # CDS spread (bps); None = not available
-    has_cva_hedge:      bool = False
+    has_cva_hedge:      bool  = False
     hedge_notional:     float = 0.0
     hedge_maturity:     float = 0.0
-    hedge_spread_bps:   Optional[float] = None  # Actual CDS spread on hedge instrument
-    sector:             str = "default"          # Counterparty sector for recovery lookup
+    hedge_spread_bps:   Optional[float] = None  # CDS spread on the hedging instrument (bps)
+    hedge_type:         str   = "DIRECT"        # DIRECT | LEGALLY_RELATED | SAME_SECTOR
+    has_index_hedge:    bool  = False            # True if an index CDS hedge is in place
+    index_notional:     float = 0.0             # Notional of index hedge
+    index_maturity:     float = 0.0             # Maturity of index hedge
+    index_rw:           float = 0.0096          # RW for index hedge (0.7 × Table 1 RW)
+    # Sector classification for SA-CVA bucket routing (MAR50.63 Table 5)
+    sector:             str   = "default"       # Maps to SECTOR_BUCKET
+    credit_quality:     str   = "IG"            # 'IG' | 'HY' | 'NR' — for SA-CVA Table 7
+    # Multiple netting sets per counterparty (MAR50.15)
+    netting_sets:       List[NettingSetEAD] = field(default_factory=list)
+    # Wrong-Way Risk (MAR50.32)
+    is_wrong_way:       bool  = False           # True if exposure correlates with PD
+    wwr_add_on:         float = 0.0             # Conservative EAD add-on for WWR (% of EAD)
 
 @dataclass
 class CVAResult:
@@ -308,6 +450,29 @@ def _effective_maturity_discount(M: float, spread: float,
     r = max(risk_free_rate, 1e-6)   # guard against zero rates
     return (1 - math.exp(-r * M)) / (r * M)
 
+def _scva_c(inp: "CVAInput", rating_map: Optional[Dict[str, str]],
+             rfr: float) -> float:
+    """
+    MAR50.15: Stand-alone CVA capital component for counterparty c.
+    SC_c = RW_c × Σ_ns (M_ns_eff × EAD_ns)
+    Sums across all netting sets when inp.netting_sets is populated;
+    falls back to the single ead / maturity_years fields otherwise.
+    WWR add-on applied to each netting set EAD if is_wrong_way is set.
+    """
+    rating = (rating_map or {}).get(inp.counterparty_id, "NR")
+    rw     = _supervisory_spread(rating)
+
+    if inp.netting_sets:
+        ns_sum = 0.0
+        for ns in inp.netting_sets:
+            ead_ns = ns.ead * (1.0 + inp.wwr_add_on) if inp.is_wrong_way else ns.ead
+            ns_sum += _effective_maturity_discount(ns.maturity_years, rw, rfr) * ead_ns
+        return rw * ns_sum
+    else:
+        ead = inp.ead * (1.0 + inp.wwr_add_on) if inp.is_wrong_way else inp.ead
+        return rw * _effective_maturity_discount(inp.maturity_years, rw, rfr) * ead
+
+
 def compute_ba_cva(
     inputs: List[CVAInput],
     rating_map: Optional[Dict[str, str]] = None,
@@ -324,98 +489,170 @@ def compute_ba_cva(
     rho: MAR50.29 floor = 0.50; stress-adjusted upward when market provided.
     """
     mkt = market or CVAMarketConditions()
-    rho = mkt.supervisory_rho()   # dynamic: 0.50 (normal) → 0.80 (crisis)
-    rfr = mkt.risk_free_rate      # current OIS/SOFR replaces hardcoded 5%
+    rho = mkt.supervisory_rho()  # Always 0.50 per MAR50.29
+    rfr = mkt.risk_free_rate
 
-    results = {}
-    sc_values = []
+    if not inputs:
+        return 0.0, {}
+
+    results   = {}
+    scva_vals = []
 
     for inp in inputs:
-        rating = (rating_map or {}).get(inp.counterparty_id, "NR")
-        rw = _supervisory_spread(rating)
-        m_eff = _effective_maturity_discount(inp.maturity_years, rw, rfr)
-        # Single-name component
-        sc_c = rw * m_eff * inp.ead
-        sc_values.append(sc_c)
-
-        # LGD: use market-implied sector recovery if available, else inp default
-        lgd = mkt.lgd_for_sector(inp.sector) if market else inp.lgd_mkt
-
-        # CVA estimate using live discount rate
-        cva_est = inp.pd_1yr * lgd * inp.ead * m_eff
-
+        sc      = _scva_c(inp, rating_map, rfr)
+        lgd     = mkt.lgd_for_sector(inp.sector) if market else inp.lgd_mkt
+        ead_eff = inp.ead * (1.0 + inp.wwr_add_on) if inp.is_wrong_way else inp.ead
+        m_eff   = _effective_maturity_discount(
+            inp.maturity_years,
+            _supervisory_spread((rating_map or {}).get(inp.counterparty_id, "NR")),
+            rfr,
+        )
+        scva_vals.append(sc)
         results[inp.counterparty_id] = CVAResult(
             counterparty_id = inp.counterparty_id,
             method          = "BA_CVA",
             fallback_trace  = None,
-            rwa_cva         = 0.0,  # filled below
-            ba_sc_charge    = sc_c,
-            cva_estimate    = cva_est,
+            rwa_cva         = 0.0,
+            ba_sc_charge    = sc,
+            cva_estimate    = inp.pd_1yr * lgd * ead_eff * m_eff,
         )
 
-    if not sc_values:
-        return 0.0, {}
+    logger.debug("BA-CVA: rho=%.2f (supervisory fixed per MAR50.29), rfr=%.3f%%",
+                 rho, rfr * 100)
 
-    logger.debug("BA-CVA: rho=%.2f (stress=%.2f), rfr=%.3f",
-                 rho, mkt.supervisory_rho(), rfr)
+    # ── Reduced BA-CVA (MAR50.14) — always computed ──────────────────────────
+    sum_sc    = sum(scva_vals)
+    sum_sc2   = sum(v ** 2 for v in scva_vals)
+    k_reduced = math.sqrt(rho ** 2 * sum_sc ** 2 + (1 - rho ** 2) * sum_sc2)
 
-    # Aggregate K_BA
-    sum_sc  = sum(sc_values)
-    sum_sc2 = sum(v**2 for v in sc_values)
-    k_ba = math.sqrt(rho**2 * sum_sc**2 + (1 - rho**2) * sum_sc2)
+    if not has_hedges:
+        # Reduced version capital = DS × K_reduced × 12.5  (MAR50.14)
+        capital      = DS * k_reduced * 12.5
+        total_sc_abs = sum(abs(v) for v in scva_vals) or 1.0
+        for i, (cid, res) in enumerate(results.items()):
+            share             = abs(scva_vals[i]) / total_sc_abs
+            res.rwa_cva       = capital * share
+            res.ba_cva_charge = DS * k_reduced * share
+        logger.info("BA-CVA reduced: K_red=%.0f  DS×K×12.5=%.0f", k_reduced, capital)
+        return capital, results
 
-    # Hedge reduction: use actual hedge CDS spread if available, else IG index
-    hedge_reduction = 0.0
-    if has_hedges:
-        for inp in inputs:
-            if not inp.has_cva_hedge:
-                continue
-            # Prefer the instrument's own market spread; fall back to IG index level
-            hedge_spread = (
-                inp.hedge_spread_bps / 10_000
-                if inp.hedge_spread_bps is not None
-                else mkt.credit_spread_ig / 10_000
-            )
-            h_eff = _effective_maturity_discount(inp.hedge_maturity, hedge_spread, rfr)
-            hedge_reduction += 0.50 * inp.hedge_notional * hedge_spread * h_eff
+    # ── Full BA-CVA (MAR50.20-21) — with SNH / IH / HMA ─────────────────────
+    # Both reduced and full must be computed; full >= beta × reduced (MAR50.20)
+    snh_vals = []
+    hma_vals = []
 
-    k_ba_net = max(k_ba - hedge_reduction, 0.0)
-    rwa_cva  = k_ba_net * 12.5
+    for inp in inputs:
+        rho_hc = HEDGE_CORRELATION.get(inp.hedge_type.upper(), 0.50)
+        if inp.has_cva_hedge and inp.hedge_notional > 0:
+            h_spread = (inp.hedge_spread_bps / 10_000
+                        if inp.hedge_spread_bps is not None
+                        else mkt.credit_spread_ig / 10_000)
+            rw_h   = _supervisory_spread((rating_map or {}).get(inp.counterparty_id, "NR"))
+            h_eff  = _effective_maturity_discount(inp.hedge_maturity, h_spread, rfr)
+            # MAR50.23: SNH_c = rho_hc × RW_h × DF_h × Notional_h
+            snh_c  = rho_hc * rw_h * h_eff * inp.hedge_notional
+            # MAR50.25: HMA_c captures misalignment of indirect hedges
+            hma_c  = (1 - rho_hc ** 2) * (rw_h * h_eff * inp.hedge_notional) ** 2
+        else:
+            snh_c = 0.0
+            hma_c = 0.0
+        snh_vals.append(snh_c)
+        hma_vals.append(hma_c)
 
-    # Distribute RWA proportionally by SC
-    total_sc = sum(abs(v) for v in sc_values) or 1.0
-    for i, (cpty_id, res) in enumerate(results.items()):
-        res.rwa_cva       = rwa_cva * abs(sc_values[i]) / total_sc
-        res.ba_cva_charge = k_ba_net * abs(sc_values[i]) / total_sc
+    # MAR50.24: IH = index hedge aggregate with 0.7 diversification factor
+    ih_total = 0.0
+    for inp in inputs:
+        if inp.has_index_hedge and inp.index_notional > 0:
+            i_eff     = _effective_maturity_discount(
+                inp.index_maturity, mkt.credit_spread_ig / 10_000, rfr)
+            ih_total += inp.index_rw * i_eff * inp.index_notional
 
-    return rwa_cva, results
+    # MAR50.21: K_full aggregation
+    systematic_sum = sum_sc - sum(snh_vals) - ih_total
+    idiosyncratic  = sum((s - h) ** 2 for s, h in zip(scva_vals, snh_vals))
+    hma_total      = sum(math.sqrt(max(h, 0.0)) for h in hma_vals)
+    k_full_sq      = rho ** 2 * systematic_sum ** 2 + (1 - rho ** 2) * idiosyncratic
+    k_full         = math.sqrt(max(k_full_sq, 0.0)) + hma_total
 
+    # MAR50.20: capital = DS × max(K_full, beta × K_reduced) × 12.5
+    k_hedged = max(k_full, BETA * k_reduced)
+    capital  = DS * k_hedged * 12.5
+
+    total_sc_abs = sum(abs(v) for v in scva_vals) or 1.0
+    for i, (cid, res) in enumerate(results.items()):
+        share             = abs(scva_vals[i]) / total_sc_abs
+        res.rwa_cva       = capital * share
+        res.ba_cva_charge = DS * k_hedged * share
+
+    logger.info(
+        "BA-CVA full: K_red=%.0f  K_full=%.0f  K_hedged=%.0f  DS×K×12.5=%.0f  "
+        "beta_floor=%s  IH=%.0f",
+        k_reduced, k_full, k_hedged, capital,
+        "ACTIVE" if k_hedged == BETA * k_reduced else "not active",
+        ih_total,
+    )
+    return capital, results
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SA-CVA (Standardised Approach) — MAR50.40–50.79
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_sa_cva_rw(inp: CVAInput) -> float:
+    """
+    MAR50.65 Table 7: Select SA-CVA delta risk weight by sector bucket and credit quality.
+
+    Previous code selected RW by pd_1yr < 0.02 threshold — this has no MAR50 basis.
+    MAR50.65 uses: (1) sector bucket (8 buckets per Table 5), (2) IG vs HY/NR.
+
+    The dynamic ig_ratio/hy_ratio market scaling also had no MAR50 basis and is removed.
+    Supervisory risk weights in SA-CVA are fixed — they cannot be scaled by current spreads.
+    """
+    bucket = SECTOR_BUCKET.get(inp.sector, SECTOR_BUCKET["default"])
+    if inp.credit_quality.upper() in ("IG",):
+        return _SA_CVA_RW_IG.get(bucket, _SA_CVA_RW_IG[7])
+    else:
+        # HY or NR: both use HY risk weights per MAR50.65 Table 7
+        return _SA_CVA_RW_HY.get(bucket, _SA_CVA_RW_HY[7])
+
 
 def compute_sa_cva(
     inputs: List[CVAInput],
     market: Optional[CVAMarketConditions] = None,
 ) -> tuple[float, Dict[str, CVAResult]]:
     """
-    SA-CVA per MAR50.40+.
-    Requires actual credit spread data per counterparty.
-    Note: Cleared trades (MAR50.8) are excluded from CVA — filter inputs before calling.
+    SA-CVA per MAR50.40-77.
 
-    Delta charge ≈ RW × ΔS/S × EAD × M_eff
-    Vega charge  ≈ 0.55 × |vega sensitivity| (simplified)
+    Requires actual credit spread data per counterparty (credit_spread_bps not None).
+    Cleared trades (MAR50.8) must be excluded before calling — filter inputs upstream.
+
+    MAR50.43: Delta capital = sum across SIX risk classes:
+      (1) Interest rate          → ∂CVA/∂r per tenor (GIRR sensitivities)
+      (2) FX                     → ∂CVA/∂FX_spot
+      (3) Counterparty credit spread → ∂CVA/∂s_counterparty  [implemented here]
+      (4) Reference credit spread    → ∂CVA/∂s_reference_name
+      (5) Equity                 → ∂CVA/∂S_equity
+      (6) Commodity              → ∂CVA/∂C_commodity
+
+    MAR50.45: Vega capital = sum across FIVE risk classes (no CCSR vega per MAR50.45).
+    MAR50.48: Vega is ALWAYS material and must be computed — even without option hedges,
+              because vega arises from σ in the exposure simulation model.
+
+    IMPLEMENTATION NOTE: This version implements the counterparty credit spread delta
+    charge only (the dominant term for most derivative books). The remaining five delta
+    risk classes (IR, FX, reference credit spread, equity, commodity) and all vega charges
+    require full CVA sensitivity computation (∂CVA/∂risk_factor per tenor/bucket) which
+    requires integration with the front-office exposure model. Production: implement
+    compute_sa_cva_full() with all six delta risk classes and all five vega risk classes.
+
+    MAR50.53: Hedging disallowance parameter R = 0.01 is applied in the bucket-level
+    aggregation to prevent perfect hedge recognition.
+
+    Risk weights: MAR50.65 Table 7 — by sector bucket (Table 5) and IG/HY/NR.
+    NO dynamic market scaling — supervisory RWs are fixed by Basel.
 
     When market is provided:
-    - OIS/SOFR rate replaces the hardcoded 5% in M_eff
-    - LGD uses sector-implied recovery rates from CDS market
-    - SA-CVA risk weights scale with the current HY/IG spread ratio
-      (wider spreads → higher spread vol → higher effective RW)
-
-    Full SA-CVA requires a complete sensitivities framework (similar to FRTB SBM)
-    applied to the CVA P&L. This is a validated approximation for a self-contained
-    simulation environment.
+    - OIS/SOFR rate replaces hardcoded 5% in M_eff (legitimate production practice)
+    - LGD uses sector-implied recovery rates from CDS market (legitimate)
     """
     mkt = market or CVAMarketConditions()
     rfr = mkt.risk_free_rate
@@ -423,45 +660,79 @@ def compute_sa_cva(
     total_delta_rwa = 0.0
     total_vega_rwa  = 0.0
 
-    # Spread-vol scaling: wider market spreads imply higher spread volatility → higher RW
-    # Anchored at CDX IG=100bp (normal). Capped at 2× supervisory floor.
-    ig_ratio  = min(mkt.credit_spread_ig / 100.0, 2.0)   # IG spread index ratio
-    hy_ratio  = min(mkt.credit_spread_hy / 400.0, 2.0)   # HY spread index ratio
+    # R = 0.01: hedging disallowance parameter (MAR50.53(1))
+    # Prevents the possibility of recognising perfect hedging of CVA risk.
+    R = 0.01
 
     for inp in inputs:
         if inp.credit_spread_bps is None:
             raise ValueError(f"SA-CVA requires credit spread for {inp.counterparty_id}")
 
-        spread = inp.credit_spread_bps / 10_000  # bps → decimal
+        spread = inp.credit_spread_bps / 10_000   # bps → decimal
         m_eff  = _effective_maturity_discount(inp.maturity_years, spread, rfr)
 
-        # LGD: sector-implied if market provided
+        # LGD: sector-implied from live CDS recovery rates if market available
         lgd = mkt.lgd_for_sector(inp.sector) if market else inp.lgd_mkt
 
-        # Delta sensitivity = ∂CVA/∂spread  (approx: EAD × M_eff × LGD)
-        delta_sens = inp.ead * m_eff * lgd
+        # WWR: apply EAD add-on for wrong-way risk counterparties (MAR50.32)
+        ead_eff = inp.ead * (1.0 + inp.wwr_add_on) if inp.is_wrong_way else inp.ead
 
-        # Risk weight: MAR50 Table 3 supervisory floor scaled by live spread environment
-        # IG: 0.96% × ig_ratio; HY/non-IG: 1.6% × hy_ratio
-        if inp.pd_1yr < 0.02:
-            rw_spread = 0.0096 * ig_ratio
-        else:
-            rw_spread = 0.0160 * hy_ratio
+        # Delta sensitivity ≈ ∂CVA/∂spread = EAD × M_eff × LGD
+        # Production: replace this approximation with AAD/bump-and-reprice per MAR50.47
+        delta_sens = ead_eff * m_eff * lgd
 
+        # Risk weight from MAR50.65 Table 7 by sector bucket and credit quality
+        # These are FIXED supervisory parameters — not market-scaled
+        rw_spread    = _resolve_sa_cva_rw(inp)
         delta_charge = rw_spread * delta_sens
-        # MAR50.45: Vega risk arises from implied volatility of hedging instruments.
-        # For a self-contained simulation without explicit option hedges, vega
-        # is typically zero for direct CVA (no optionality in the exposure driver).
-        # The 0.55×delta×0.10 heuristic had no regulatory basis.
-        # Production: compute ∂CVA/∂σ from Greeks of hedging swaptions/FX options.
-        vega_charge  = 0.0   # Set to zero; override when option hedges are present
 
-        rwa_delta = delta_charge * 12.5
-        rwa_vega  = vega_charge  * 12.5
+        # MAR50.48: Vega is ALWAYS material — must be computed even without option hedges.
+        # Vega arises from volatilities in the exposure model (Hull-White σ_r, Black σ_eq).
+        # Production implementation:
+        #   vega_sens   = ∂CVA/∂σ_k  (bump σ_k by 1%, compute change in CVA)
+        #   vega_charge = RW_vega_k × vega_sens_k  (RW_vega = 100% for most classes)
+        # Set to zero here because this simulation does not expose exposure-model vols.
+        # Replace with a real implementation when front-office model integration is available.
+        vega_charge = 0.0
+        logger.debug(
+            "SA-CVA %s: vega_charge=0 (MAR50.48 requires production computation; "
+            "override required for regulatory compliance)",
+            inp.counterparty_id,
+        )
+
+        # Net weighted sensitivity with hedging disallowance (MAR50.53)
+        # WS_net = delta_charge - (1-R) × delta_charge_hedge
+        # For this single-risk-class approximation, hedge benefit reduced by R=0.01
+        hedge_benefit = 0.0
+        if inp.has_cva_hedge and inp.hedge_spread_bps is not None:
+            h_spread  = inp.hedge_spread_bps / 10_000
+            h_m_eff   = _effective_maturity_discount(inp.hedge_maturity, h_spread, rfr)
+            rho_hc    = HEDGE_CORRELATION.get(inp.hedge_type.upper(), 0.50)
+            # Hedge sensitivity (positive, as hedge value increases when spread widens)
+            h_delta   = rho_hc * rw_spread * inp.hedge_notional * h_m_eff * lgd
+            # MAR50.52: WS_net = WS_cva - WS_hedge = delta_charge - (1-R)×h_delta
+            hedge_benefit = (1.0 - R) * h_delta
+        net_delta = max(delta_charge - hedge_benefit, 0.0)
+
+        rwa_delta = net_delta   * 12.5
+        rwa_vega  = vega_charge * 12.5
         rwa_cva   = rwa_delta + rwa_vega
 
         total_delta_rwa += rwa_delta
         total_vega_rwa  += rwa_vega
+
+        logger.debug(
+            "SA-CVA %s: bucket=%d cq=%s RW=%.2f%% delta_sens=%.0f "
+            "delta_charge=%.0f rwa=%.0f%s",
+            inp.counterparty_id,
+            SECTOR_BUCKET.get(inp.sector, 7),
+            inp.credit_quality,
+            rw_spread * 100,
+            delta_sens,
+            delta_charge,
+            rwa_cva,
+            " [WWR]" if inp.is_wrong_way else "",
+        )
 
         results[inp.counterparty_id] = CVAResult(
             counterparty_id = inp.counterparty_id,
@@ -470,7 +741,7 @@ def compute_sa_cva(
             rwa_cva         = rwa_cva,
             sa_delta_charge = delta_charge,
             sa_vega_charge  = vega_charge,
-            cva_estimate    = inp.pd_1yr * lgd * inp.ead * m_eff,
+            cva_estimate    = inp.pd_1yr * lgd * ead_eff * m_eff,
         )
 
     return total_delta_rwa + total_vega_rwa, results
@@ -480,8 +751,74 @@ def compute_sa_cva(
 # CVA Master Engine — routing + fallback logic (req #13)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# MAR50.9 materiality threshold: if aggregate CCR RWA < threshold → proxy
-CCR_MATERIALITY_THRESHOLD = 1_000_000  # USD 1M — simulation; real = notional-based (MAR50.9)
+# MAR50.9 materiality threshold.
+# MAR50.9(1): any bank whose aggregate notional of non-centrally cleared derivatives
+# is ≤ 100 billion EUR is below the threshold.
+# The threshold is:
+#   - Based on AGGREGATE NOTIONAL (not CCR RWA)
+#   - Denominated in EUR
+#   - Set at 100,000,000,000 EUR (100 billion)
+# Previous code used USD 1M CCR RWA which is wrong by four orders of magnitude
+# and will suppress BA-CVA/SA-CVA for almost any portfolio.
+EUR_USD_FX: float = 1.08  # approximate — override with live rate in production
+NOTIONAL_MATERIALITY_THRESHOLD_EUR: float = 100_000_000_000   # 100 billion EUR
+
+def estimate_proxy_spread(
+    sector: str,
+    credit_quality: str,
+    region: str = "US",
+    liquid_peer_spreads: Optional[Dict[str, float]] = None,
+) -> Optional[float]:
+    """
+    MAR50.32(3): Estimate a proxy credit spread for illiquid counterparties
+    whose credit is not actively traded. The bank must estimate spreads from
+    liquid peers via a documented sector + rating + region mapping algorithm.
+
+    In production, this mapping should be calibrated to a panel of liquid CDS
+    names in the same sector/rating/region and updated at least monthly.
+
+    Parameters
+    ----------
+    sector          : Counterparty sector (Financials, Energy, Consumer, etc.)
+    credit_quality  : 'IG', 'HY', or 'NR'
+    region          : Issuer region for basis adjustment (US, EUR, EM, etc.)
+    liquid_peer_spreads : Optional dict of live peer spreads for averaging.
+                         {peer_name: spread_bps}
+
+    Returns
+    -------
+    Estimated CDS spread in bps, or None if insufficient peer data.
+    """
+    # Use live peer spreads if supplied (preferred)
+    if liquid_peer_spreads and len(liquid_peer_spreads) >= 3:
+        return float(sum(liquid_peer_spreads.values()) / len(liquid_peer_spreads))
+
+    # Fallback: sector × rating × region lookup table
+    # Values are rough proxies — replace with live calibration in production
+    _PROXY: Dict[tuple, float] = {
+        ("Financials",  "IG",  "US"):  110,  ("Financials",  "HY",  "US"):  420,
+        ("Financials",  "IG",  "EUR"): 120,  ("Financials",  "HY",  "EUR"): 450,
+        ("Energy",      "IG",  "US"):  130,  ("Energy",      "HY",  "US"):  480,
+        ("Energy",      "IG",  "EUR"): 140,  ("Energy",      "HY",  "EUR"): 500,
+        ("Consumer",    "IG",  "US"):  115,  ("Consumer",    "HY",  "US"):  430,
+        ("Technology",  "IG",  "US"):  100,  ("Technology",  "HY",  "US"):  390,
+        ("Sovereign",   "IG",  "US"):   50,  ("Sovereign",   "HY",  "EM"):  350,
+        ("Industrials", "IG",  "US"):  120,  ("Industrials", "HY",  "US"):  450,
+        ("Healthcare",  "IG",  "US"):  105,  ("Healthcare",  "HY",  "US"):  400,
+    }
+    key    = (sector, credit_quality, region)
+    spread = _PROXY.get(key)
+    if spread is None:
+        # Regional basis: EM typically 50-100bp wider than US equivalent
+        em_basis = 75 if region == "EM" else 0
+        us_key   = (sector, credit_quality, "US")
+        spread   = (_PROXY.get(us_key, 300 if credit_quality == "IG" else 600) + em_basis)
+    logger.debug(
+        "Proxy spread for %s/%s/%s: %.0f bps (from lookup; calibrate to live peers)",
+        sector, credit_quality, region, spread,
+    )
+    return spread
+
 
 class CVAEngine:
     """
@@ -551,7 +888,15 @@ class CVAEngine:
         total_ccr_rwa: float,
         rating_map: Optional[Dict[str, str]] = None,
         run_date: Optional[date] = None,
+        **kwargs,
     ) -> Dict:
+        """
+        Additional kwargs:
+            total_notional_eur (float): aggregate notional of non-cleared derivatives
+                in EUR equivalent. Required for correct MAR50.9 materiality check.
+                If omitted, materiality threshold is not applied (conservative — full
+                CVA computation runs regardless of portfolio size).
+        """
         """
         Compute CVA RWA for the full portfolio with method routing.
 
@@ -582,11 +927,21 @@ class CVAEngine:
                     run_date, exc,
                 )
 
-        # MAR50.9 — materiality check
-        if total_ccr_rwa < CCR_MATERIALITY_THRESHOLD:
-            rwa_cva = total_ccr_rwa  # 100% CCR RWA as proxy
-            trace   = f"PORTFOLIO|CCR_PROXY|{CVA_FALLBACK_REASONS['BELOW_THRESHOLD']}"
-            logger.warning("CVA: below materiality threshold → CCR proxy RWA=%.0f", rwa_cva)
+        # MAR50.9 materiality check — based on aggregate notional of non-cleared derivatives
+        # MAR50.9(1): threshold = EUR 100 billion aggregate notional.
+        # total_notional_eur should be supplied by the caller as the sum of all non-cleared
+        # derivative notionals in EUR equivalent. If not provided, we cannot apply the
+        # threshold correctly — default to applying the full CVA calculation (conservative).
+        total_notional_eur = kwargs.get("total_notional_eur", float("inf"))
+        if total_notional_eur <= NOTIONAL_MATERIALITY_THRESHOLD_EUR:
+            rwa_cva = total_ccr_rwa  # MAR50.9(2): proxy = 100% of CCR capital requirement
+            trace   = (f"PORTFOLIO|CCR_PROXY|{CVA_FALLBACK_REASONS['BELOW_THRESHOLD']}"
+                       f"|notional_eur={total_notional_eur:.0f}")
+            logger.warning(
+                "CVA: below MAR50.9 materiality (notional=EUR %.0fbn ≤ 100bn) "
+                "→ CCR proxy RWA=%.0f",
+                total_notional_eur / 1e9, rwa_cva,
+            )
             return {
                 "total_rwa_cva": rwa_cva,
                 "method_summary": {},

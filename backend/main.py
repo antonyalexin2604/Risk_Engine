@@ -112,7 +112,7 @@ class PrometheusRunner:
             cpty_id = port["counterparty"]["id"]
             logger.info("Processing derivative portfolio: %s", pid)
 
-            saccr_res  = self.saccr.compute_ead(netting, run_date)
+            saccr_res  = self.saccr.compute_ead(netting, run_date, portfolio_id=pid)
             imm_trades = [t for t in trades if t.saccr_method == "IMM"]
             imm_res    = None
             if imm_trades:
@@ -154,6 +154,7 @@ class PrometheusRunner:
                     "addon_equity": saccr_res.add_on_equity,
                     "addon_commodity": saccr_res.add_on_commodity,
                     "addon_agg": saccr_res.add_on_aggregate,
+                    "trade_results": saccr_res.trade_results,
                 },
                 "imm": imm_res,
                 "ead_imm_csa": imm_res.get("ead_imm_csa", 0) if imm_res else 0,
@@ -333,10 +334,14 @@ class PrometheusRunner:
         rng = random.Random(hash(pid) % 2**31)
 
         # MAR21 risk class mapping
+        # MAR21.78: EQ maps to EQ_LARGE by default; EQ_SMALL for buckets 11/13.
+        # The uploaded frtb.py no longer accepts plain "EQ" in risk_classes —
+        # validate_sensitivities() fires before _resolve_risk_class(), so we
+        # must emit the correct split class directly from main.py.
         rc_map = {
             "IR":    "GIRR",
             "FX":    "FX",
-            "EQ":    "EQ",
+            "EQ":    "EQ_LARGE",   # default; override to EQ_SMALL for buckets 11/13
             "CR":    "CSR_NS",
             "CMDTY": "CMDTY",
         }
@@ -376,8 +381,12 @@ class PrometheusRunner:
             elif rc == "CSR_NS":
                 bucket = str(rng.randint(1, 8))   # credit quality buckets 1-8
                 risk_factor = f"CSR_{bucket}_{t.trade_id[:8]}"
-            elif rc == "EQ":
-                bucket = str(rng.randint(1, 10))
+            elif rc in ("EQ_LARGE", "EQ_SMALL"):
+                # MAR21.78: buckets 1-10, 12 = large-cap (EQ_LARGE)
+                #           buckets 11, 13  = small-cap (EQ_SMALL)
+                # Draw from 1-12 to include small-cap bucket 11 (not 13 — rare)
+                bucket     = str(rng.randint(1, 12))
+                rc         = "EQ_SMALL" if bucket in ("11", "13") else "EQ_LARGE"
                 risk_factor = f"EQ_SECTOR_{bucket}"
             elif rc == "FX":
                 bucket = "1"
