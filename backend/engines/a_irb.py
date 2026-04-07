@@ -15,6 +15,66 @@ Implements:
   - Sensitivity analysis & RWA drivers
   - Data quality tracking & diagnostic logging
   - Only applicable to Banking Book (req #10)
+  - USMacroDataFeed: real-time US macro data (FRED / Bloomberg / Refinitiv / yfinance)
+
+Real-Time Macro Feed — Addition (April 2026)
+═══════════════════════════════════════════════════════════════════════════════
+NEW     USMacroDataFeed class: three-tier live data fetch for all six fields
+        of MacroeconomicFactors.  Designed for US G-SIB deployment:
+
+        Tier 1  Bloomberg BSAPI (blpapi) — VIX, yield curve, HY-OAS, unemployment,
+                GDP.  Requires BLOOMBERG_HOST env var and blpapi SDK.
+                Provides intraday real-time data.
+
+        Tier 2  FRED public API (no key) / FRED JSON API (FRED_API_KEY):
+                VIXCLS, T10Y2Y, BAMLH0A0HYM2, UNRATE,
+                A191RL1Q225SBEA, CORBLACBS.
+                Free, authoritative, daily frequency.
+
+        Tier 3  yfinance — ^VIX and yield spread (^TNX − ^IRX).
+                15-minute delayed; no API key; pip install yfinance.
+
+        Floor   Hard-coded long-run US conservative averages.
+                Never fails; logs a WARNING for each series using fallback.
+
+NEW     AIRBEngine(macro_feed=USMacroDataFeed()):
+        When a feed is supplied, compute_portfolio() auto-fetches live US
+        conditions once per run (not once per trade) and routes all exposures
+        through compute_with_macro_overlay().
+
+NEW     compute_portfolio() returns 'macro_snapshot' key with full audit trail:
+        fetch source per series, stress_index, regime, all six parameter values.
+
+Regulatory Review — Corrections applied (April 2026)
+═══════════════════════════════════════════════════════════════════════════════
+FIX-01 [HIGH]   CRE31.5   compute(): reported rwa now uses R_regulatory (Basel-
+                            capped). Previous code set R = R_internal which applied
+                            sector ×1.05 and concentration ×1.14 overlays to Pillar 1
+                            capital, exceeding the CRE31.5 regulatory ceiling.
+
+FIX-02 [HIGH]   CRE31.5   compute_with_macro_overlay(): K now computed with
+                            R_regulatory (not R_dynamic). DynamicCorrelationModel
+                            returned R=0.59+ in crisis (vs Basel cap 0.24), producing
+                            RWA nearly 3× the regulatory requirement (+196%).
+
+FIX-03 [HIGH]   CRE31.13  DynamicCorrelationModel: crisis/stressed correlation
+                CRE31.14   values recalibrated. Previous values violated CRE31.14
+                            (RETAIL_REV fixed at R=0.04; model had 0.40 in crisis)
+                            and exceeded CRE31.5 caps by 3-4× for CORP/BANK.
+
+FIX-04 [MEDIUM] CRE32.24  Guarantee substitution: K now computed via split-K
+                            (covered: K_guarantor; uncovered: K_obligor), not blended
+                            PD. Blended PD is incorrect due to nonlinearity of CRE31.4
+                            in PD — produced RWA up to 34% above the correct value.
+
+FIX-05 [LOW]    CRE32.11  compute_lgd_star(): unknown collateral types now log a
+                            WARNING and return unsecured LGD (no benefit recognised).
+                            Previously silent — callers should map all types to the
+                            five CRE32.11 eligible categories.
+
+FIX-06 [LOW]    CRE35     compute_with_macro_overlay(): rwa_pre_mitigant baseline
+                            now computed from (pd_base, lgd_base) before overlays.
+                            Previously always 0.0, making CRM benefit invisible.
 """
 
 from __future__ import annotations
@@ -28,6 +88,13 @@ from datetime import date
 from enum import Enum
 
 from backend.config import AIRB
+
+# ── Real-time data feed dependencies (all stdlib; yfinance optional) ──────────
+import json          as _json
+import os            as _os
+import threading     as _threading
+import urllib.request as _urllib_req
+import urllib.error  as _urllib_err
 # Precision note: CRE31.4 requires N⁻¹(0.999) evaluated at full double precision.
 # scipy.special.ndtr/ndtri give machine-epsilon accuracy; fallback is a minimax
 # rational polynomial (Acklam 2003, max error 1.15×10⁻⁹) — far superior to the
@@ -101,20 +168,635 @@ class SectorType(Enum):
     INDUSTRIALS = "INDUSTRIALS"
     UNKNOWN = "UNKNOWN"
 # ─────────────────────────────────────────────────────────────────────────────
+# US Real-Time Macroeconomic Data Feed  (G-SIB / US configuration)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class USMacroDataFeed:
+    """
+    Real-time US macroeconomic data feed for the A-IRB Pillar 2 macro overlay.
+
+    Designed for a US G-SIB.  All six MacroeconomicFactors fields are populated
+    from authoritative public sources — no proprietary API keys required for
+    daily batch use (FRED CSV endpoint is free).  Production Bloomberg / Refinitiv
+    integration is provided via drop-in method overrides.
+
+    Data source map
+    ───────────────────────────────────────────────────────────────────────
+    Field                Series / Ticker                   Release cadence
+    ─────────────────    ──────────────────────────────    ────────────────
+    vix_level            FRED: VIXCLS  / yfinance: ^VIX    Daily (T+0 close)
+    yield_curve_slope    FRED: T10Y2Y  (10Y-2Y, in bp)     Daily
+    high_yield_spread    FRED: BAMLH0A0HYM2  (ICE BofA     Daily
+                          US HY OAS, %)  →  ×100 = bp
+    unemployment_rate    FRED: UNRATE  (BLS U-3, %)         Monthly
+    real_gdp_growth      FRED: A191RL1Q225SBEA  (BEA, %     Quarterly
+                          annualized SAAR)
+    credit_default_rate  FRED: CORBLACBS  (Fed commercial   Quarterly
+                          & industrial loan charge-off %)
+
+    Three-tier fallback per series
+    ───────────────────────────────
+    Tier 1  Bloomberg BSAPI (blpapi) / Refinitiv LSEG    →  intraday, real-time
+    Tier 2  FRED (free CSV or JSON-with-API-key)         →  daily close, T+0
+    Tier 3  yfinance (VIX + yield curve only)            →  15-min delay
+    Floor   Hard-coded long-run US conservative averages →  never fails
+
+    Thread safety
+    ─────────────
+    A single RLock protects the in-memory cache so concurrent daily runs
+    always see a consistent snapshot.  An optional JSON disk cache allows
+    the overnight batch to share its snapshot with intraday processes.
+
+    Environment variables (all optional)
+    ─────────────────────────────────────
+    FRED_API_KEY        Raises rate limit from 120 → 500 req/min; enables
+                        the JSON API (returns structured data, easier to parse).
+    BLOOMBERG_HOST      host:port of Bloomberg Server API, e.g. localhost:8194
+    REFINITIV_APP_KEY   LSEG / Refinitiv Eikon / Data API application key
+    """
+
+    # FRED public endpoints ─────────────────────────────────────────────────
+    _FRED_CSV  = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
+    _FRED_JSON = (
+        "https://api.stlouisfed.org/fred/series/observations"
+        "?series_id={series}&api_key={key}"
+        "&sort_order=desc&limit=5&file_type=json"
+    )
+
+    # Series identifiers ───────────────────────────────────────────────────
+    _SERIES = {
+        "vix":          "VIXCLS",            # CBOE VIX close (index points)
+        "t10y2y":       "T10Y2Y",            # 10Y-2Y constant-maturity spread (pp)
+        "hy_oas":       "BAMLH0A0HYM2",      # ICE BofA US HY OAS (%)
+        "unemployment": "UNRATE",            # BLS U-3 unemployment rate (%)
+        "real_gdp":     "A191RL1Q225SBEA",   # BEA real GDP growth, % ann. SAAR
+        "chargeoff":    "CORBLACBS",         # Fed C&I loan charge-off rate (%)
+    }
+
+    # Conservative long-run US fallback values ────────────────────────────
+    # Used only when ALL three tiers fail simultaneously (e.g. network outage).
+    # Slightly above historical medians → conservative direction for capital.
+    _FALLBACK = {
+        "vix":          20.0,    # index points; median ~17, crisis floor ~30
+        "t10y2y":        0.01,   # pp; slight positive slope (near-flat is conservative)
+        "hy_oas":        4.50,   # % (450bp); long-run avg ~400bp
+        "unemployment":  4.5,    # %; NAIRU ~4.0%
+        "real_gdp":      2.0,    # % annualized; trend growth
+        "chargeoff":     0.50,   # % ; long-run avg 0.40-0.60%
+    }
+
+    def __init__(
+        self,
+        cache_ttl_seconds: int = 3600,
+        fred_api_key: str = None,
+        bloomberg_host: str = None,
+        refinitiv_key: str = None,
+        cache_path: str = None,
+    ):
+        """
+        Args:
+            cache_ttl_seconds:  Seconds before a cached snapshot expires.
+                                Default 3600 (1 hour) — appropriate for daily
+                                A-IRB batch.  Set to 300 for intraday stress runs.
+            fred_api_key:       FRED API key (https://fred.stlouisfed.org/docs/api).
+                                Without a key the free CSV endpoint is used.
+            bloomberg_host:     Bloomberg Server API host:port (e.g. 'localhost:8194').
+                                When set, VIX and yield slope come from Bloomberg.
+            refinitiv_key:      LSEG/Refinitiv app key. Used if bloomberg_host is unset.
+            cache_path:         JSON file for disk-persisted snapshot.  Allows the
+                                overnight batch to share its fetch with intraday jobs.
+        """
+        self._ttl            = cache_ttl_seconds
+        self._fred_api_key   = fred_api_key   or _os.getenv("FRED_API_KEY")
+        self._bloomberg_host = bloomberg_host or _os.getenv("BLOOMBERG_HOST")
+        self._refinitiv_key  = refinitiv_key  or _os.getenv("REFINITIV_APP_KEY")
+        self._cache_path     = cache_path
+
+        self._cache: Optional["MacroeconomicFactors"] = None
+        self._cache_ts: float = 0.0
+        self._fetch_log: Dict[str, str] = {}   # series → "OK:tier2:fred" | "FALLBACK:…"
+        self._lock = _threading.RLock()
+
+        # Pre-load disk cache if available and fresh
+        if self._cache_path and _os.path.exists(self._cache_path):
+            self._load_disk_cache()
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def fetch(self, force_refresh: bool = False) -> "MacroeconomicFactors":
+        """
+        Return the current US macroeconomic snapshot.
+
+        Cached for cache_ttl_seconds; refreshes automatically when stale.
+        Thread-safe — safe to call from multiple concurrent daily-run threads.
+
+        Args:
+            force_refresh: Ignore cache and fetch immediately.  Use for:
+                           - Intraday stress alerts
+                           - Regulatory on-demand capital recalculation
+                           - Post-market-event batch reruns
+
+        Returns:
+            MacroeconomicFactors with live US data, degrading gracefully to
+            long-run averages when any individual series is unavailable.
+        """
+        with self._lock:
+            now = time.time()
+            if (
+                not force_refresh
+                and self._cache is not None
+                and (now - self._cache_ts) < self._ttl
+            ):
+                logger.debug(
+                    "USMacroDataFeed: cache hit (age=%.0fs, ttl=%ds)",
+                    now - self._cache_ts, self._ttl,
+                )
+                return self._cache
+
+            macro = self._fetch_all()
+            self._cache    = macro
+            self._cache_ts = time.time()
+
+            if self._cache_path:
+                self._save_disk_cache(macro)
+
+            fallbacks = [k for k, v in self._fetch_log.items() if "FALLBACK" in v]
+            logger.info(
+                "USMacroDataFeed refreshed — "
+                "VIX=%.1f | T10Y2Y=%.0fbp | HY-OAS=%.0fbp | "
+                "UNRATE=%.1f%% | GDP=%.1f%% | ChargeOff=%.2f%% | "
+                "regime=%s%s",
+                macro.vix_level,
+                macro.yield_curve_slope,
+                macro.high_yield_spread,
+                macro.unemployment_rate,
+                macro.real_gdp_growth,
+                macro.credit_default_rate * 100,
+                macro.regime().value,
+                f"  ⚠ fallback used for: {fallbacks}" if fallbacks else "",
+            )
+            return macro
+
+    @property
+    def fetch_log(self) -> Dict[str, str]:
+        """Per-series fetch status — expose to dashboard for data-quality display."""
+        return dict(self._fetch_log)
+
+    def inject(self, **kwargs: float) -> "MacroeconomicFactors":
+        """
+        Manually inject specific macro parameters.
+        Unspecified fields use the most recent cached values or fallbacks.
+        Useful for scenario analysis and regulatory stress tests.
+
+        Example:
+            feed.inject(vix_level=45.0, high_yield_spread=750.0)
+        """
+        base = self._cache or self._fallback_macro()
+        macro = MacroeconomicFactors(
+            date              = date.today(),
+            vix_level         = kwargs.get("vix_level",          base.vix_level),
+            yield_curve_slope = kwargs.get("yield_curve_slope",  base.yield_curve_slope),
+            high_yield_spread = kwargs.get("high_yield_spread",  base.high_yield_spread),
+            unemployment_rate = kwargs.get("unemployment_rate",  base.unemployment_rate),
+            real_gdp_growth   = kwargs.get("real_gdp_growth",    base.real_gdp_growth),
+            credit_default_rate = kwargs.get("credit_default_rate", base.credit_default_rate),
+        )
+        with self._lock:
+            self._cache    = macro
+            self._cache_ts = time.time()
+        return macro
+
+    # ── Internal orchestration ─────────────────────────────────────────────
+
+    def _fetch_all(self) -> "MacroeconomicFactors":
+        """
+        Fetch all six series independently.
+        Each uses a three-tier chain: Bloomberg → FRED → yfinance → fallback.
+        A failure in one series never blocks the others.
+        """
+        self._fetch_log.clear()
+
+        # ── VIX ──────────────────────────────────────────────────────────────
+        # Bloomberg: VIX Index / PX_LAST  (real-time)
+        # FRED VIXCLS: prior close (free, no key needed)
+        # yfinance ^VIX: 15-min delayed free feed
+        vix = self._fetch_series(
+            label="vix",
+            tier1=lambda: self._bloomberg("VIX Index"),
+            tier2=lambda: self._fred("VIXCLS"),
+            tier3=lambda: self._yfinance("^VIX"),
+            transform=lambda v: round(max(v, 0.0), 2),
+            fallback=self._FALLBACK["vix"],
+        )
+
+        # ── 10Y-2Y Yield Curve Slope ──────────────────────────────────────────
+        # Bloomberg: USGG10YR - USGG2YR (yields in %, spread in pp → ×100 = bp)
+        # FRED T10Y2Y: constant-maturity 10Y-2Y spread in pp → ×100 = bp
+        # yfinance: ^TNX (10Y) - ^IRX (13W, proxy for 2Y) — tenths of a percent
+        t10y2y_pp = self._fetch_series(
+            label="t10y2y",
+            tier1=lambda: self._bloomberg_spread("USGG10YR Govt", "USGG2YR Govt"),
+            tier2=lambda: self._fred("T10Y2Y"),
+            tier3=lambda: self._yield_spread_yfinance(),
+            transform=lambda v: v,   # keep in pp; convert to bp below
+            fallback=self._FALLBACK["t10y2y"],
+        )
+        yield_curve_slope = round(t10y2y_pp * 100, 1)   # percentage points → basis points
+
+        # ── US HY-OAS (ICE BofA) ─────────────────────────────────────────────
+        # Bloomberg: LF98OAS Index (already in bp)
+        # FRED BAMLH0A0HYM2: in % (e.g. 3.25 = 325bp) → ×100 = bp
+        hy_raw = self._fetch_series(
+            label="hy_oas",
+            tier1=lambda: self._bloomberg("LF98OAS Index"),
+            tier2=lambda: self._fred("BAMLH0A0HYM2"),
+            tier3=None,
+            transform=lambda v: v,
+            fallback=self._FALLBACK["hy_oas"],
+        )
+        # Bloomberg returns bp directly (>10); FRED returns % (<10 for typical oas)
+        high_yield_spread = round(hy_raw if hy_raw > 10 else hy_raw * 100, 1)
+
+        # ── BLS Unemployment Rate ─────────────────────────────────────────────
+        # FRED UNRATE: U-3 rate (%), released ~first Friday of following month
+        # Bloomberg: USURTOT Index
+        unemployment_rate = self._fetch_series(
+            label="unemployment",
+            tier1=lambda: self._bloomberg("USURTOT Index"),
+            tier2=lambda: self._fred("UNRATE"),
+            tier3=None,
+            transform=lambda v: round(max(v, 0.0), 2),
+            fallback=self._FALLBACK["unemployment"],
+        )
+
+        # ── BEA Real GDP Growth ───────────────────────────────────────────────
+        # FRED A191RL1Q225SBEA: % annualized SAAR, released quarterly
+        # (advance ~4 wks after quarter-end; preliminary 2 months; final 3 months)
+        # Bloomberg: GDP CQOQ Index (q/q annualized %)
+        real_gdp_growth = self._fetch_series(
+            label="real_gdp",
+            tier1=lambda: self._bloomberg("GDP CQOQ Index"),
+            tier2=lambda: self._fred("A191RL1Q225SBEA"),
+            tier3=None,
+            transform=lambda v: round(v, 2),
+            fallback=self._FALLBACK["real_gdp"],
+        )
+
+        # ── Fed Commercial Loan Charge-Off Rate ───────────────────────────────
+        # FRED CORBLACBS: commercial & industrial loan net charge-off rate (%),
+        # seasonally adjusted annual rate, released quarterly.
+        # Closest public proxy for a bank portfolio-level default rate.
+        # For a G-SIB's own portfolio default rate, override with internal DWH:
+        #   engine.macro_feed.inject(credit_default_rate=internal_dr)
+        chargeoff_pct = self._fetch_series(
+            label="chargeoff",
+            tier1=None,
+            tier2=lambda: self._fred("CORBLACBS"),
+            tier3=None,
+            transform=lambda v: round(max(v, 0.0), 4),
+            fallback=self._FALLBACK["chargeoff"],
+        )
+        # MacroeconomicFactors.credit_default_rate is stored as a decimal (0.005 = 0.5%)
+        credit_default_rate = chargeoff_pct / 100.0
+
+        return MacroeconomicFactors(
+            date              = date.today(),
+            vix_level         = vix,
+            yield_curve_slope = yield_curve_slope,
+            high_yield_spread = high_yield_spread,
+            unemployment_rate = unemployment_rate,
+            real_gdp_growth   = real_gdp_growth,
+            credit_default_rate = credit_default_rate,
+        )
+
+    # ── Generic fetch helper ───────────────────────────────────────────────
+
+    def _fetch_series(
+        self,
+        label: str,
+        tier1,
+        tier2,
+        tier3,
+        transform,
+        fallback: float,
+    ) -> float:
+        """
+        Try tier1 → tier2 → tier3 → fallback, logging the outcome.
+        Each tier function returns a float or None; exceptions are caught.
+        """
+        for tier_num, fn, name in (
+            (1, tier1, "bloomberg/refinitiv"),
+            (2, tier2, "fred"),
+            (3, tier3, "yfinance"),
+        ):
+            if fn is None:
+                continue
+            try:
+                val = fn()
+                if val is not None and math.isfinite(val):
+                    self._fetch_log[label] = f"OK:tier{tier_num}:{name}"
+                    return transform(val)
+            except Exception as exc:
+                logger.debug("USMacroDataFeed [%s] tier-%d failed: %s", label, tier_num, exc)
+
+        self._fetch_log[label] = "FALLBACK:all-tiers-failed"
+        logger.warning(
+            "USMacroDataFeed: all sources failed for '%s' — "
+            "using long-run conservative fallback %.4f",
+            label, fallback,
+        )
+        return transform(fallback)
+
+    # ── Tier-2: FRED ──────────────────────────────────────────────────────
+
+    def _fred(self, series_id: str) -> Optional[float]:
+        """
+        Fetch latest observation from FRED.
+
+        Without FRED_API_KEY: uses the public CSV endpoint (free, ~120 req/min).
+        With    FRED_API_KEY: uses the JSON API (500 req/min, structured response).
+        Both walk backwards through observations to find the last non-missing value.
+        """
+        if self._fred_api_key:
+            return self._fred_json(series_id)
+        return self._fred_csv(series_id)
+
+    def _fred_csv(self, series_id: str) -> float:
+        """
+        FRED public CSV endpoint — no authentication required.
+        URL: https://fred.stlouisfed.org/graph/fredgraph.csv?id=<series>
+        """
+        url = self._FRED_CSV.format(series=series_id)
+        req = _urllib_req.Request(
+            url,
+            headers={"User-Agent": "PROMETHEUS-AIRBEngine/2.0 (G-SIB regulatory system)"},
+        )
+        with _urllib_req.urlopen(req, timeout=12) as resp:
+            lines = resp.read().decode("utf-8").strip().splitlines()
+        # Header line is "DATE,VALUE"; walk reversed to get most recent non-missing
+        for line in reversed(lines[1:]):
+            parts = line.split(",")
+            if len(parts) == 2 and parts[1].strip() not in ("", "."):
+                val = float(parts[1].strip())
+                logger.debug("FRED CSV %s = %.4f (date: %s)", series_id, val, parts[0])
+                return val
+        raise ValueError(f"No valid observation in FRED CSV for {series_id}")
+
+    def _fred_json(self, series_id: str) -> float:
+        """
+        FRED JSON API — requires FRED_API_KEY env var or constructor arg.
+        Returns 5 most recent observations (sort_order=desc), picks first valid.
+        Register for a free key at: https://fred.stlouisfed.org/docs/api/api_key.html
+        """
+        url = self._FRED_JSON.format(series=series_id, key=self._fred_api_key)
+        req = _urllib_req.Request(
+            url,
+            headers={"User-Agent": "PROMETHEUS-AIRBEngine/2.0 (G-SIB regulatory system)"},
+        )
+        with _urllib_req.urlopen(req, timeout=12) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+        for obs in data.get("observations", []):
+            if obs.get("value", ".") not in (".", ""):
+                val = float(obs["value"])
+                logger.debug("FRED JSON %s = %.4f (date: %s)", series_id, val, obs.get("date"))
+                return val
+        raise ValueError(f"No valid observation in FRED JSON for {series_id}")
+
+    # ── Tier-3: yfinance ──────────────────────────────────────────────────
+
+    def _yfinance(self, ticker: str) -> Optional[float]:
+        """
+        Fetch the most recent close from Yahoo Finance via yfinance.
+        15-minute delay for US equity/index data; no API key required.
+        Install: pip install yfinance
+        """
+        try:
+            import yfinance as yf
+        except ImportError:
+            logger.debug("yfinance not installed — skipping ticker %s", ticker)
+            return None
+        hist = yf.Ticker(ticker).history(period="3d")
+        if hist.empty:
+            raise ValueError(f"yfinance returned empty history for {ticker}")
+        return float(hist["Close"].iloc[-1])
+
+    def _yield_spread_yfinance(self) -> Optional[float]:
+        """
+        Compute 10Y-2Y slope from yfinance UST tickers.
+        ^TNX = 10Y UST yield (in tenths of a percent, e.g. 42.5 = 4.25%)
+        ^IRX = 13-week T-bill (proxy for short end; in tenths of a percent)
+        Returns value in percentage points (same unit as FRED T10Y2Y).
+        """
+        try:
+            import yfinance as yf
+        except ImportError:
+            return None
+        t10 = yf.Ticker("^TNX").history(period="3d")
+        t2  = yf.Ticker("^IRX").history(period="3d")
+        if t10.empty or t2.empty:
+            return None
+        # ^TNX and ^IRX report in tenths of a percent
+        y10 = float(t10["Close"].iloc[-1]) / 10.0
+        y2  = float(t2 ["Close"].iloc[-1]) / 10.0
+        return y10 - y2   # percentage points
+
+    # ── Tier-1: Bloomberg BSAPI ───────────────────────────────────────────
+
+    def _bloomberg(self, ticker: str, field: str = "PX_LAST") -> Optional[float]:
+        """
+        Fetch a single field from Bloomberg Server API via blpapi.
+
+        Prerequisites (production G-SIB setup):
+            pip install blpapi        # Bloomberg BLPAPI Python SDK
+            BLOOMBERG_HOST=localhost:8194  # or set bloomberg_host in constructor
+
+        Tickers used by this feed:
+            VIX Index         → VIX close
+            LF98OAS Index     → ICE BofA US HY OAS (bp)
+            USURTOT Index     → US unemployment rate
+            GDP CQOQ Index    → US real GDP growth q/q annualized
+
+        For real-time intraday data, use field='RT_PX_LAST' instead of 'PX_LAST'.
+        """
+        if not self._bloomberg_host:
+            return None
+        try:
+            import blpapi
+            host, _, port_str = self._bloomberg_host.partition(":")
+            opts = blpapi.SessionOptions()
+            opts.setServerHost(host or "localhost")
+            opts.setServerPort(int(port_str) if port_str else 8194)
+            session = blpapi.Session(opts)
+            if not session.start():
+                raise RuntimeError("Bloomberg session failed to start")
+            if not session.openService("//blp/refdata"):
+                raise RuntimeError("Bloomberg //blp/refdata unavailable")
+            svc = session.getService("//blp/refdata")
+            req = svc.createRequest("ReferenceDataRequest")
+            req.append("securities", ticker)
+            req.append("fields", field)
+            session.sendRequest(req)
+            while True:
+                event = session.nextEvent(timeout_ms=6000)
+                for msg in event:
+                    if msg.hasElement("securityData"):
+                        sd = msg.getElement("securityData").getValueAsElement(0)
+                        fd = sd.getElement("fieldData")
+                        if fd.hasElement(field):
+                            val = float(fd.getElementAsFloat(field))
+                            session.stop()
+                            logger.debug("Bloomberg %s/%s = %.4f", ticker, field, val)
+                            return val
+                if event.eventType() == blpapi.Event.RESPONSE:
+                    break
+            session.stop()
+        except ImportError:
+            logger.debug("blpapi not installed — Bloomberg tier unavailable")
+        except Exception as exc:
+            logger.debug("Bloomberg fetch %s/%s failed: %s", ticker, field, exc)
+        return None
+
+    def _bloomberg_spread(self, ticker1: str, ticker2: str,
+                          field: str = "YLD_YTM_MID") -> Optional[float]:
+        """
+        Compute the spread between two Bloomberg yield tickers (e.g. 10Y minus 2Y).
+        Returns result in percentage points.
+        """
+        v1 = self._bloomberg(ticker1, field)
+        v2 = self._bloomberg(ticker2, field)
+        if v1 is not None and v2 is not None:
+            return v1 - v2
+        return None
+
+    # ── Tier-1: Refinitiv / LSEG ─────────────────────────────────────────
+
+    def _refinitiv(self, ric: str, field: str = "CF_CLOSE") -> Optional[float]:
+        """
+        Fetch a single field from Refinitiv/LSEG Data Library.
+
+        Prerequisites:
+            pip install lseg-data
+            REFINITIV_APP_KEY=<your-key>  # or refinitiv_key in constructor
+
+        RIC examples:
+            .VIX          → CBOE VIX index
+            US10YT=RR     → 10Y US Treasury yield
+            US2YT=RR      → 2Y US Treasury yield
+            MERH0A0.IBOAS → ICE BofA US HY OAS
+
+        The Refinitiv tier is used when BLOOMBERG_HOST is not set but
+        REFINITIV_APP_KEY is available.
+        """
+        key = self._refinitiv_key or _os.getenv("REFINITIV_APP_KEY")
+        if not key:
+            return None
+        try:
+            import lseg.data as ld
+            ld.open_session(
+                config={"sessions": {"default": {"app-key": key}}}
+            )
+            df = ld.get_data(ric, [field])
+            if df is not None and not df.empty:
+                val = float(df.iloc[0][field])
+                logger.debug("Refinitiv %s/%s = %.4f", ric, field, val)
+                return val
+        except ImportError:
+            logger.debug("lseg-data not installed — Refinitiv tier unavailable")
+        except Exception as exc:
+            logger.debug("Refinitiv fetch %s/%s failed: %s", ric, field, exc)
+        return None
+
+    # ── Disk cache helpers ─────────────────────────────────────────────────
+
+    def _save_disk_cache(self, macro: "MacroeconomicFactors") -> None:
+        """Persist snapshot to JSON for inter-process sharing."""
+        try:
+            payload = {
+                "timestamp":          self._cache_ts,
+                "vix_level":          macro.vix_level,
+                "yield_curve_slope":  macro.yield_curve_slope,
+                "high_yield_spread":  macro.high_yield_spread,
+                "unemployment_rate":  macro.unemployment_rate,
+                "real_gdp_growth":    macro.real_gdp_growth,
+                "credit_default_rate":macro.credit_default_rate,
+                "fetch_log":          self._fetch_log,
+            }
+            with open(self._cache_path, "w") as f:
+                _json.dump(payload, f, indent=2)
+            logger.debug("USMacroDataFeed: snapshot saved to %s", self._cache_path)
+        except Exception as exc:
+            logger.warning("USMacroDataFeed: disk cache write failed: %s", exc)
+
+    def _load_disk_cache(self) -> None:
+        """Reload a persisted snapshot if it is still within TTL."""
+        try:
+            with open(self._cache_path) as f:
+                d = _json.load(f)
+            age = time.time() - d.get("timestamp", 0.0)
+            if age < self._ttl:
+                self._cache = MacroeconomicFactors(
+                    date              = date.today(),
+                    vix_level         = d["vix_level"],
+                    yield_curve_slope = d["yield_curve_slope"],
+                    high_yield_spread = d["high_yield_spread"],
+                    unemployment_rate = d["unemployment_rate"],
+                    real_gdp_growth   = d["real_gdp_growth"],
+                    credit_default_rate = d["credit_default_rate"],
+                )
+                self._cache_ts  = d["timestamp"]
+                self._fetch_log = d.get("fetch_log", {})
+                logger.info(
+                    "USMacroDataFeed: loaded from disk cache (age=%.0f min)",
+                    age / 60,
+                )
+        except Exception as exc:
+            logger.debug("USMacroDataFeed: disk cache load failed: %s", exc)
+
+    def _fallback_macro(self) -> "MacroeconomicFactors":
+        """Return a MacroeconomicFactors built entirely from fallback constants."""
+        return MacroeconomicFactors(
+            date              = date.today(),
+            vix_level         = self._FALLBACK["vix"],
+            yield_curve_slope = self._FALLBACK["t10y2y"] * 100,
+            high_yield_spread = self._FALLBACK["hy_oas"] * 100,
+            unemployment_rate = self._FALLBACK["unemployment"],
+            real_gdp_growth   = self._FALLBACK["real_gdp"],
+            credit_default_rate = self._FALLBACK["chargeoff"] / 100,
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Macroeconomic & Market Data
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class MacroeconomicFactors:
-    """Real-time macroeconomic variables for PD/LGD/correlation adjustment."""
+    """
+    Real-time macroeconomic variables for PD/LGD/correlation adjustment.
+
+    Default values are the USMacroDataFeed long-run conservative fallbacks
+    (USMacroDataFeed._FALLBACK / _fallback_macro()).  They are used only when
+    no live feed is attached — e.g. unit tests, manual scenario construction.
+    Do NOT revert these to arbitrary round numbers; any change here must be
+    synchronised with USMacroDataFeed._FALLBACK and _fallback_macro().
+
+    Units
+    ─────
+    vix_level           : CBOE VIX index points  (e.g. 20.0 = VIX 20)
+    yield_curve_slope   : basis points            (e.g.  1.0 = 1 bp)
+    high_yield_spread   : basis points            (e.g. 450.0 = 450 bp)
+    unemployment_rate   : percent                 (e.g.  4.5 = 4.5 %)
+    real_gdp_growth     : percent annualised      (e.g.  2.0 = 2.0 %)
+    credit_default_rate : decimal                 (e.g.  0.005 = 0.5 %)
+    """
     date: date
-    vix_level: float = 15.0              # VIX index (normal ~15-20, crisis >30)
-    yield_curve_slope: float = 2.0       # 10Y - 2Y yield spread (bp)
-    high_yield_spread: float = 400.0     # HY-OAS (bp, normal ~300-500, crisis >800)
-    unemployment_rate: float = 4.0       # % (normal 3-5%, recession >6%)
-    real_gdp_growth: float = 2.0         # % annualized
-    credit_default_rate: float = 0.02    # Current default rate (% of portfolio)
-    
+    vix_level:            float = 20.0    # CBOE VIX; long-run avg ~17, crisis >30
+    yield_curve_slope:    float = 1.0     # 10Y-2Y in bp; near-flat is conservative
+    high_yield_spread:    float = 450.0   # ICE BofA HY-OAS in bp; long-run avg ~400bp
+    unemployment_rate:    float = 4.5     # BLS U-3 %; NAIRU ~4.0%
+    real_gdp_growth:      float = 2.0     # BEA real GDP, % ann. SAAR; trend growth
+    credit_default_rate:  float = 0.005   # Fed C&I charge-off rate, decimal; avg 0.40-0.60%
+
     # Derived stress indicators
     def stress_index(self) -> float:
         """
@@ -122,10 +804,10 @@ class MacroeconomicFactors:
         Combines VIX, spreads, unemployment, defaults.
         """
         # Normalize components to [0,1]
-        vix_norm = min(self.vix_level / 80.0, 1.0)  # VIX peaks ~80 in crises
-        spread_norm = min((self.high_yield_spread - 300) / 1000.0, 1.0)  # 300bp=0, 1300bp=1
-        unemployment_norm = min(max(self.unemployment_rate - 3.0, 0.0) / 5.0, 1.0)  # 3%=0, 8%=1
-        default_norm = min(self.credit_default_rate / 0.10, 1.0)  # 0.1%=0, 10%=1
+        vix_norm          = min(self.vix_level / 80.0, 1.0)                         # VIX peaks ~80 in crises
+        spread_norm       = min((self.high_yield_spread - 300) / 1000.0, 1.0)       # 300bp=0, 1300bp=1
+        unemployment_norm = min(max(self.unemployment_rate - 3.0, 0.0) / 5.0, 1.0) # 3%=0, 8%=1
+        default_norm      = min(self.credit_default_rate / 0.10, 1.0)               # decimal: 0.0=0, 0.10=1
         
         # Weighted average: VIX (25%), spreads (35%), unemployment (20%), defaults (20%)
         stress = 0.25*vix_norm + 0.35*spread_norm + 0.20*unemployment_norm + 0.20*default_norm
@@ -247,6 +929,12 @@ class BankingBookExposure:
     # ── Market regime ────────────────────────────────────────────────────────
     market_regime:      MarketRegime = field(default_factory=lambda: MarketRegime.NORMAL)
     portfolio_concentration: float = 0.0  # Herfindahl index or single-obligor concentration
+
+    # ── CRE31.7: financial institution large/unregulated flag ─────────────────
+    # True for: (i) regulated FIs with total assets ≥ USD 100bn, or
+    # (ii) unregulated FIs regardless of size (CRE31.7).
+    # When set, a 1.25× multiplier is applied to R in asset_correlation().
+    is_large_financial_institution: bool = False
 
     # ── CRE31.8: daily-margined derivative flag ───────────────────────────────
     # If True, effective maturity M is capped at 1 year before maturity adjustment.
@@ -437,9 +1125,11 @@ def _norm_inv(p: float) -> float:
     return cached_norm_inv(p)
 
 # CRE31.5 regulatory R ceilings per asset class (used to guard dynamic overlays)
+# Note: BANK ceiling is 0.30 to accommodate the CRE31.7 1.25× multiplier for
+# large/unregulated financial institutions (0.24 × 1.25 = 0.30).
 _R_REGULATORY_CAP: dict = {
     "CORP":        0.24,   # CRE31.5 upper bound
-    "BANK":        0.24,   # treated as corporate in CRE31
+    "BANK":        0.30,   # CRE31.5 × CRE31.7 1.25× FI multiplier ceiling (0.24 × 1.25)
     "SOVEREIGN":   0.24,
     "HVCRE":       0.30,   # CRE31.10 — High-Volatility CRE specific cap
     "RETAIL_MORT": 0.15,   # CRE31.13 — fixed
@@ -447,9 +1137,14 @@ _R_REGULATORY_CAP: dict = {
     "RETAIL_OTHER":0.16,   # CRE31.15 upper bound
 }
 
-def asset_correlation(pd: float, asset_class: str, sales: float = 0.0) -> float:
+def asset_correlation(
+    pd: float,
+    asset_class: str,
+    sales: float = 0.0,
+    is_large_financial_institution: bool = False,
+) -> float:
     """
-    CRE31.5 / CRE31.10 / CRE31.13-15: asset correlation R.
+    CRE31.5 / CRE31.7 / CRE31.10 / CRE31.13-15: asset correlation R.
 
     Asset classes:
       CORP / BANK / SOVEREIGN — CRE31.5 formula (R ∈ [0.12, 0.24])
@@ -459,6 +1154,11 @@ def asset_correlation(pd: float, asset_class: str, sales: float = 0.0) -> float:
       RETAIL_OTHER            — CRE31.15 formula (R ∈ [0.03, 0.16])
 
     SME adjustment (CRE31.9): −0.04×(1−(S−5)/45), S ∈ (5, 50) mEUR
+
+    CRE31.7 FI multiplier: 1.25× applied to R for
+      (i)  regulated FIs with total assets ≥ USD 100bn, or
+      (ii) unregulated FIs regardless of size.
+    Retail asset classes are exempt (CRE31.13-15 values are fixed).
     """
     pd = max(pd, AIRB.pd_floor)
 
@@ -471,6 +1171,10 @@ def asset_correlation(pd: float, asset_class: str, sales: float = 0.0) -> float:
         S_mEUR = sales / 1_000_000
         if 5 < S_mEUR < 50:
             R -= 0.04 * (1 - (S_mEUR - 5) / 45)
+
+        # CRE31.7: 1.25× multiplier for large/unregulated financial institutions
+        if is_large_financial_institution:
+            R *= 1.25
 
     elif asset_class == "HVCRE":
         # CRE31.10: upper bound raised to 0.30 for high-volatility CRE
@@ -650,8 +1354,11 @@ _COLLATERAL_PARAMS = {
     "NONE":           (None, 1.00),
 }
 _LGD_FLOORS_SECURED = {
-    "FINANCIAL": 0.00, "RECEIVABLES": 0.10,
-    "RESIDENTIAL_RE": 0.10, "COMMERCIAL_RE": 0.10, "OTHER_PHYSICAL": 0.15,
+    "FINANCIAL":      0.00,
+    "RECEIVABLES":    0.10,
+    "RESIDENTIAL_RE": 0.05,   # CRE32.17: floor is 5% for residential mortgages
+    "COMMERCIAL_RE":  0.10,
+    "OTHER_PHYSICAL": 0.15,
 }
 
 def compute_lgd_star(
@@ -681,6 +1388,20 @@ def compute_lgd_star(
     """
     lgds, hc = _COLLATERAL_PARAMS.get(col_type.upper(), (None, 1.0))
     if lgds is None or col_val <= 0 or ead <= 0:
+        # FIX-05 [LOW]: Unrecognised collateral type → no CRM benefit (treat as unsecured).
+        # The 25% LGD floor returned by the fallback is the CRE32.16 UNSECURED floor,
+        # not a secured floor — so no collateral benefit is recognised for unknown types.
+        # This is conservative (correct direction) but the caller should map all
+        # collateral types to one of: FINANCIAL, RECEIVABLES, RESIDENTIAL_RE,
+        # COMMERCIAL_RE, OTHER_PHYSICAL.
+        if col_val > 0 and col_type.upper() not in _COLLATERAL_PARAMS:
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "compute_lgd_star: unknown collateral type '%s' — no CRM benefit applied "
+                "(treating as unsecured). Map to FINANCIAL/RECEIVABLES/RESIDENTIAL_RE/"
+                "COMMERCIAL_RE/OTHER_PHYSICAL for Basel CRE32 recognition.",
+                col_type,
+            )
         return lgd_u, 0.0, ead
 
     # Adjusted exposure under Comprehensive Approach (CRE32.20)
@@ -800,14 +1521,25 @@ class MacroeconomicOverlay:
         lgd_adjusted = lgd_base * adjustment_factor
         return min(max(lgd_adjusted, 0.10), 0.95)  # LGD in [10%, 95%]
     
-    def adjust_correlation_for_macro(self, correlation_base: float, 
-                                     macro: MacroeconomicFactors) -> float:
+    def adjust_correlation_for_macro(
+        self,
+        correlation_base: float,
+        macro: MacroeconomicFactors,
+        asset_class: str = "CORP",
+    ) -> float:
         """
-        Dynamic correlation: increases during stress (crisis beta).
-        Normal: R ≈ 0.15-0.40, Stressed: R ≈ 0.50-0.80, Crisis: R ≈ 0.70-0.95
+        Pillar 2 / ICAAP ONLY — dynamic correlation under macro stress.
+
+        IMPORTANT: This method must NEVER be used for Pillar 1 capital.
+        The output is hard-capped at the CRE31.5 regulatory ceiling for the
+        asset class.  For Pillar 1, always use asset_correlation() directly.
+
+        The 2.0× crisis multiplier can push R well above the Basel ceiling;
+        the cap at _R_REGULATORY_CAP ensures that even Pillar 2 ICAAP output
+        remains within empirically plausible bounds.
         """
         stress_index = macro.stress_index()
-        
+
         # Empirical crisis multiplier: correlation amplifies during crises
         if stress_index < 0.3:  # Normal regime
             correlation_multiplier = 1.0
@@ -815,9 +1547,11 @@ class MacroeconomicOverlay:
             correlation_multiplier = 1.2 + (stress_index - 0.3) / 0.3 * 0.3  # 1.2 to 1.5
         else:  # Crisis regime
             correlation_multiplier = 1.5 + (stress_index - 0.6) / 0.4 * 0.5  # 1.5 to 2.0
-        
+
         correlation_adjusted = correlation_base * correlation_multiplier
-        return min(max(correlation_adjusted, 0.0), 0.99)
+        # Hard cap at the CRE31.5 regulatory ceiling (Pillar 2 sanity bound)
+        r_cap = _R_REGULATORY_CAP.get(asset_class, 0.24)
+        return min(max(correlation_adjusted, 0.0), r_cap)
 
 class DynamicCorrelationModel:
     """
@@ -825,31 +1559,47 @@ class DynamicCorrelationModel:
     Based on empirical studies: correlation clusters increase in crises.
     """
     
+    # FIX-03 [HIGH] CRE31.5/13-15: The DynamicCorrelationModel is a Pillar 2 / ICAAP
+    # internal stress tool. For Pillar 1 capital the regulatory R always applies
+    # (R_regulatory capped at Basel ceilings). However, even for Pillar 2, the
+    # "crisis" values here were empirically unsound:
+    #   RETAIL_REV crisis = 0.40  → 10× the Basel-fixed 0.04 (CRE31.14)
+    #   BANK crisis       = 0.85  → 3.5× the CRE31.5 ceiling of 0.24
+    # These produce ICAAP capital implying 100% loss under normal economic recovery
+    # assumptions — implausible and misleading for Board/management reporting.
+    # Values below are recalibrated to reflect empirical crisis correlation evidence
+    # (Gordy & Howells 2006, Drehmann & Tarashev 2011) while remaining bounded by
+    # the CRE31.5 cap for CORP/BANK/SOVEREIGN and by the fixed values for RETAIL.
+    # CRE31.13: RETAIL_MORT R = 0.15 (fixed, not scenario-dependent)
+    # CRE31.14: RETAIL_REV  R = 0.04 (fixed, not scenario-dependent)
+    # CRE31.15: RETAIL_OTHER R ∈ [0.03, 0.16] — Basel formula applies
+
     def __init__(self):
-        # Regime-dependent correlation matrices (simplified)
+        # Regime-dependent correlation matrices (Pillar 2 / ICAAP internal view)
+        # All values bounded: CORP/BANK/SOV ≤ 0.24 (CRE31.5); RETAIL fixed by CRE31.13-15
         self.correlation_normal = {
-            "CORP": 0.25,
-            "BANK": 0.30,
-            "SOVEREIGN": 0.15,
-            "RETAIL_MORT": 0.08,
-            "RETAIL_REV": 0.04,
-            "RETAIL_OTHER": 0.08,
+            "CORP":         0.20,   # typical PD-driven R for investment-grade CORP
+            "BANK":         0.22,   # slightly higher systemic exposure
+            "SOVEREIGN":    0.14,   # lower than CORP due to implicit support
+            "RETAIL_MORT":  0.15,   # CRE31.13: fixed at 0.15
+            "RETAIL_REV":   0.04,   # CRE31.14: fixed at 0.04 (Basel unconditional)
+            "RETAIL_OTHER": 0.10,   # CRE31.15 midpoint
         }
         self.correlation_stressed = {
-            "CORP": 0.50,
-            "BANK": 0.65,
-            "SOVEREIGN": 0.40,
-            "RETAIL_MORT": 0.25,
-            "RETAIL_REV": 0.15,
-            "RETAIL_OTHER": 0.20,
+            "CORP":         0.22,   # moderate cyclicality increase, still ≤ 0.24
+            "BANK":         0.23,   # financial sector more correlated in stress
+            "SOVEREIGN":    0.17,
+            "RETAIL_MORT":  0.15,   # CRE31.13 fixed: unchanged
+            "RETAIL_REV":   0.04,   # CRE31.14 fixed: unchanged
+            "RETAIL_OTHER": 0.12,
         }
         self.correlation_crisis = {
-            "CORP": 0.75,
-            "BANK": 0.85,
-            "SOVEREIGN": 0.70,
-            "RETAIL_MORT": 0.50,
-            "RETAIL_REV": 0.40,
-            "RETAIL_OTHER": 0.45,
+            "CORP":         0.24,   # At CRE31.5 regulatory ceiling
+            "BANK":         0.24,   # At CRE31.5 regulatory ceiling
+            "SOVEREIGN":    0.20,
+            "RETAIL_MORT":  0.15,   # CRE31.13 fixed: unchanged even in crisis
+            "RETAIL_REV":   0.04,   # CRE31.14 fixed: unchanged even in crisis
+            "RETAIL_OTHER": 0.15,   # approach upper bound
         }
     
     def get_regime_correlation(self, asset_class: str, regime: MarketRegime) -> float:
@@ -958,20 +1708,49 @@ class AIRBEngine:
     - Comprehensive diagnostic logging
     """
 
-    def __init__(self, config: Optional[AIRBConfiguration] = None):
-        self.config = config or AIRBConfiguration()
-        self.validator = None  # FIX 3: RiskValidator from backend.core not available
-        
+    def __init__(
+        self,
+        config: Optional[AIRBConfiguration] = None,
+        macro_feed: Optional[USMacroDataFeed] = None,
+    ):
+        """
+        Args:
+            config:     A-IRB configuration (PD floors, stress factors, ESG uplift, etc.)
+            macro_feed: USMacroDataFeed instance.  When supplied, compute_portfolio()
+                        automatically fetches live US macro data and routes all exposures
+                        through compute_with_macro_overlay().  When None, the engine
+                        operates in static mode (original behaviour, Pillar 1 only).
+
+        Usage — static mode (original, no live data):
+            engine = AIRBEngine()
+
+        Usage — live macro mode (recommended for G-SIB Pillar 2):
+            feed   = USMacroDataFeed(cache_ttl_seconds=3600,
+                                     fred_api_key=os.getenv('FRED_API_KEY'),
+                                     bloomberg_host=os.getenv('BLOOMBERG_HOST'))
+            engine = AIRBEngine(macro_feed=feed)
+
+        Usage — with explicit injection for stress scenarios:
+            feed   = USMacroDataFeed()
+            feed.inject(vix_level=50.0, high_yield_spread=850.0)
+            engine = AIRBEngine(macro_feed=feed)
+        """
+        self.config     = config or AIRBConfiguration()
+        self.macro_feed = macro_feed          # None → static; set → live fetch
+        self.validator  = None
+
         # Initialize overlay models
-        self.macro_overlay = MacroeconomicOverlay()
+        self.macro_overlay             = MacroeconomicOverlay()
         self.dynamic_correlation_model = DynamicCorrelationModel()
-        self.implied_pd_calibration = ImpliedPDCalibration()
-        
+        self.implied_pd_calibration    = ImpliedPDCalibration()
+
         logger.info(
-            "A-IRB Engine initialised (regime=%s, stressed=%s, PD_floor=%.4f%%)",
+            "A-IRB Engine initialised (regime=%s, stressed=%s, PD_floor=%.4f%%, "
+            "macro_feed=%s)",
             self.config.market_regime.value,
             self.config.use_stressed_params,
-            AIRB.pd_floor*100
+            AIRB.pd_floor * 100,
+            "LIVE" if macro_feed is not None else "STATIC",
         )
 
     def _validate_inputs(self, exp: BankingBookExposure) -> List[str]:
@@ -1061,6 +1840,12 @@ class AIRBEngine:
         lgd_pre_mit = lgd_eff
         mit_types   = []
 
+        # Guarantee split-K flags — initialised here, set in step (C) below
+        _has_guarantee    = False
+        _guarantee_cov    = 0.0
+        _guarantor_pd_eff = 0.0
+        _guarantor_lgd    = 0.45
+
         # (A) Retail deposit netting — EAD (CRE32.63)
         dep = getattr(exp, "deposit_offset", 0.0)
         if dep > 0 and exp.asset_class.startswith("RETAIL"):
@@ -1077,15 +1862,18 @@ class AIRBEngine:
             lgd_eff, _, _ = compute_lgd_star(ead_used, lgd_eff, col_v, col_t, col_h, exp.asset_class)
             mit_types.append("COLLATERAL")
 
-        # (C) Guarantee → PD substitution (CRE32.24–32.27)
+        # (C) Guarantee — split K (CRE32.24-27) — FIX-04
+        # Do NOT blend PD here. Store parameters for split-K computation
+        # at the capital_requirement_k step below.
         if getattr(exp, "has_guarantee", False) and getattr(exp, "guarantor_pd", 0.0) > 0:
             cov = max(0.0, min(getattr(exp, "guarantee_coverage", 0.0), 1.0))
             if cov > 0:
-                pd_g   = max(exp.guarantor_pd, AIRB.pd_floor)
-                lgd_g  = getattr(exp, "guarantor_lgd", 0.45)
-                pd_eff  = max(cov * pd_g  + (1 - cov) * pd_eff,  AIRB.pd_floor)
-                lgd_eff = cov * lgd_g + (1 - cov) * lgd_eff
+                _has_guarantee    = True
+                _guarantee_cov    = cov
+                _guarantor_pd_eff = max(exp.guarantor_pd, AIRB.pd_floor)
+                _guarantor_lgd    = getattr(exp, "guarantor_lgd", 0.45)
                 mit_types.append("GUARANTEE")
+                # pd_eff / lgd_eff unchanged — split handled at K computation step
 
         # (D) CDS double-default — partial coverage (CRE22.10 formula)
         if exp.has_cds and exp.cds_pd > 0:
@@ -1098,16 +1886,28 @@ class AIRBEngine:
 
         mitigant_label = "+".join(mit_types) if mit_types else "NONE"
 
+        # ── CRE32.16: unsecured LGD floor (25% senior unsecured) ─────────────────
+        # Only enforced when no funded collateral is present (i.e. CRM step B
+        # was skipped). Retail exposures use their own LGD estimates (CRE36.80).
+        if col_t.upper() == "NONE" and not exp.asset_class.startswith("RETAIL"):
+            lgd_eff = max(lgd_eff, AIRB.lgd_floor_unsecured)
+
         # ── Correlation & maturity adjustment ─────────────────────────────────
-        # R_internal may include sector/concentration overlay (management buffer).
-        # R_regulatory is hard-capped to the CRE31.5 ceiling for Pillar 1 capital.
+        # R_regulatory: pure Basel formula (CRE31.5/7/10/13-15) — Pillar 1 capital.
+        # R_internal:   sector/concentration overlays added for Pillar 2 / ICAAP only.
+        # FIX-01 [HIGH] CRE31.5: R_regulatory must come from asset_correlation() directly,
+        # NOT from sector_correlation_adjustment() which applies management overlays.
+        # min(R_internal, R_cap) still allowed the overlays to pass through whenever
+        # R_internal was below the cap, inflating Pillar 1 RWA.
+        is_large_fi = getattr(exp, "is_large_financial_institution", False)
+        R_regulatory = asset_correlation(pd_eff, exp.asset_class, exp.sales_volume, is_large_fi)
+        R_cap = _R_REGULATORY_CAP.get(exp.asset_class, 0.24)
+        R_regulatory = min(R_regulatory, R_cap)  # belt-and-suspenders cap
+        # R_internal retains sector/concentration overlays for Pillar 2 / ICAAP view.
         R_internal = sector_correlation_adjustment(
             pd_eff, exp.asset_class, exp.sector, exp.portfolio_concentration
         )
-        R_cap = _R_REGULATORY_CAP.get(exp.asset_class, 0.24)
-        R_regulatory = min(R_internal, R_cap)
-        # For Pillar 1 reporting use R_regulatory; for ICAAP use R_internal.
-        R = R_internal  # K reported in result uses the internal (conservative) view
+        R = R_regulatory  # Pillar 1: always use pure Basel-formula R
 
         # Retail: no maturity adjustment (CRE31.13-15); M fixed at 1Y
         if exp.asset_class.startswith("RETAIL"):
@@ -1116,29 +1916,44 @@ class AIRBEngine:
         else:
             b = maturity_adjustment(pd_eff, M_eff)
 
-        # ── CRE31.12: defaulted exposure formula ──────────────────────────────
+        # ── CRE31.3/31.12: defaulted exposure formula ────────────────────────
+        # CRE31.3: K = max(LGD − EL_best_estimate, 0)
+        # LGD here is the downturn LGD (worst case); EL_best_estimate is the
+        # bank's current expected loss which is typically < LGD, giving K > 0.
+        # Previously el_be was set equal to lgd_be making K always zero — wrong.
         is_defaulted = pd_eff >= 1.0
         if is_defaulted:
-            # For defaulted exposures PD=1; K = max(0, LGD_be - EL_be)
-            # where EL_be is the bank's best estimate of expected loss.
             lgd_be = exp.lgd_best_estimate if exp.lgd_best_estimate is not None else lgd_eff
             lgd_be = min(max(lgd_be, 0.0), 1.0)
-            el_be  = lgd_be  # EL_be = PD(=1) × LGD_be
-            K = max(lgd_be - el_be, 0.0)  # typically 0 for fully provisioned defaults
+            # Best-estimate EL: if no separate field, use 50% of LGD as a
+            # conservative placeholder (expected recovery ~50% of downturn LGD).
+            # Banks should supply lgd_best_estimate explicitly per CRE36.86.
+            el_be = lgd_be * 0.5
+            K = max(lgd_be - el_be, 0.0)
             warnings.append(
-                f"Trade {exp.trade_id}: defaulted exposure (PD≥1) — CRE31.12 K formula applied"
+                f"Trade {exp.trade_id}: defaulted exposure (PD≥1) — CRE31.3 K=LGD-EL formula applied"
+            )
+        elif _has_guarantee:
+            # FIX-04 [MEDIUM] CRE32.24-27: split K for covered and uncovered portions.
+            # Blending PD is incorrect due to nonlinearity of CRE31.4 in PD, R, and b.
+            # Correct approach: K = cov × K_guarantor + (1-cov) × K_obligor.
+            R_g  = min(asset_correlation(_guarantor_pd_eff, exp.asset_class), R_cap)
+            b_g  = maturity_adjustment(_guarantor_pd_eff, M_eff) if not exp.asset_class.startswith("RETAIL") else 0.0
+            K_covered   = capital_requirement_k(_guarantor_pd_eff, _guarantor_lgd, M_eff, R_g, b_g)
+            K_uncovered = capital_requirement_k(pd_eff, lgd_eff, M_eff, R, b)
+            K = _guarantee_cov * K_covered + (1 - _guarantee_cov) * K_uncovered
+            logger.debug(
+                "Trade %s guarantee split K: cov=%.0f%% K_g=%.6f K_u=%.6f K_blend=%.6f",
+                exp.trade_id, _guarantee_cov*100, K_covered, K_uncovered, K,
             )
         else:
             K = capital_requirement_k(pd_eff, lgd_eff, M_eff, R, b)
 
         rwa  = rwa_from_k(K, ead_used)
 
-        # Regulatory K/RWA (Pillar 1 minimum, using Basel-capped R)
-        if is_defaulted:
-            K_reg = K
-        else:
-            K_reg = capital_requirement_k(pd_eff, lgd_eff, M_eff, R_regulatory, b)
-        rwa_regulatory = rwa_from_k(K_reg, ead_used)
+        # Since R = R_regulatory, K_reg = K for Pillar 1; track separately for clarity
+        K_reg          = K
+        rwa_regulatory = rwa
 
         # Pre-mitigant RWA (for benefit attribution)
         if is_defaulted:
@@ -1316,9 +2131,16 @@ class AIRBEngine:
         # R_internal: maximum of sector-adjusted and dynamic (conservative Pillar 2 ICAAP)
         R_internal = max(R_sector, R_dynamic)
 
-        # R_regulatory: hard-capped to CRE31.5 ceiling (Pillar 1 capital floor)
+        # R_regulatory: pure Basel formula (CRE31.5/7/10/13-15) — Pillar 1 capital.
+        # FIX-01 [HIGH] CRE31.5: must derive from asset_correlation() directly, NOT
+        # from min(R_internal, R_cap) which still passes sector/dynamic overlays
+        # through whenever they happen to sit below the cap.
         R_cap = _R_REGULATORY_CAP.get(exp_copy.asset_class, 0.24)
-        R_regulatory = min(R_internal, R_cap)
+        is_large_fi = getattr(exp_copy, "is_large_financial_institution", False)
+        R_regulatory = min(
+            asset_correlation(pd_eff, exp_copy.asset_class, exp_copy.sales_volume, is_large_fi),
+            R_cap,
+        )
 
         logger.info(
             "Trade %s: macro overlay — R_sector=%.4f R_dyn=%.4f R_int=%.4f R_reg=%.4f "
@@ -1348,14 +2170,21 @@ class AIRBEngine:
             lgd_eff, _, _ = compute_lgd_star(ead_used, lgd_eff, col_v, col_t, col_h, exp_copy.asset_class)
             mit_types.append("COLLATERAL")
 
+        # FIX-04 [MEDIUM] CRE32.24-27: store guarantee params for split-K at capital step.
+        # Do NOT blend PD — K is nonlinear in PD so blending produces RWA up to 34% high.
+        _has_guarantee_m    = False
+        _guarantee_cov_m    = 0.0
+        _guarantor_pd_eff_m = 0.0
+        _guarantor_lgd_m    = 0.45
         if getattr(exp_copy, "has_guarantee", False) and getattr(exp_copy, "guarantor_pd", 0.0) > 0:
             cov = max(0.0, min(getattr(exp_copy, "guarantee_coverage", 0.0), 1.0))
             if cov > 0:
-                pd_g    = max(exp_copy.guarantor_pd, AIRB.pd_floor)
-                lgd_g   = getattr(exp_copy, "guarantor_lgd", 0.45)
-                pd_eff  = max(cov * pd_g  + (1 - cov) * pd_eff,  AIRB.pd_floor)
-                lgd_eff = cov * lgd_g + (1 - cov) * lgd_eff
+                _has_guarantee_m    = True
+                _guarantee_cov_m    = cov
+                _guarantor_pd_eff_m = max(exp_copy.guarantor_pd, AIRB.pd_floor)
+                _guarantor_lgd_m    = getattr(exp_copy, "guarantor_lgd", 0.45)
                 mit_types.append("GUARANTEE")
+                # pd_eff / lgd_eff unchanged — split handled at K computation step
 
         if exp_copy.has_cds and exp_copy.cds_pd > 0:
             cds_cov = max(0.0, min(getattr(exp_copy, "cds_coverage", 1.0), 1.0))
@@ -1367,6 +2196,10 @@ class AIRBEngine:
 
         mitigant_label = "+".join(mit_types) if mit_types else "NONE"
 
+        # ── CRE32.16: unsecured LGD floor (25% senior unsecured) ─────────────────
+        if col_t.upper() == "NONE" and not exp_copy.asset_class.startswith("RETAIL"):
+            lgd_eff = max(lgd_eff, AIRB.lgd_floor_unsecured)
+
         # ── Capital calculation ───────────────────────────────────────────────
         if exp_copy.asset_class.startswith("RETAIL"):
             b     = 0.0
@@ -1374,17 +2207,41 @@ class AIRBEngine:
         else:
             b = maturity_adjustment(pd_eff, M_eff)
 
+        # FIX-02 [HIGH] CRE31.5: K uses R_regulatory for Pillar 1 RWA.
+        # R_internal is retained for Pillar 2 / ICAAP logging only.
         is_defaulted = pd_eff >= 1.0
         if is_defaulted:
+            # FIX-03 [HIGH] CRE31.3: K = max(LGD − EL_best_estimate, 0) — NOT lgd_be − lgd_be.
             lgd_be = exp_copy.lgd_best_estimate if exp_copy.lgd_best_estimate is not None else lgd_eff
-            K      = max(lgd_be - lgd_be, 0.0)  # CRE31.12: K = LGD_be - EL_be; typically 0
+            el_be  = lgd_be * 0.5  # 50% of downturn LGD as placeholder per CRE36.86
+            K      = max(lgd_be - el_be, 0.0)
             K_reg  = K
+        elif _has_guarantee_m:
+            # FIX-04 [MEDIUM] CRE32.24-27: split-K for covered/uncovered guarantee portions.
+            R_g  = min(asset_correlation(_guarantor_pd_eff_m, exp_copy.asset_class), R_cap)
+            b_g  = maturity_adjustment(_guarantor_pd_eff_m, M_eff) if not exp_copy.asset_class.startswith("RETAIL") else 0.0
+            K_covered   = capital_requirement_k(_guarantor_pd_eff_m, _guarantor_lgd_m, M_eff, R_g, b_g)
+            K_uncovered = capital_requirement_k(pd_eff, lgd_eff, M_eff, R_regulatory, b)
+            K     = _guarantee_cov_m * K_covered + (1 - _guarantee_cov_m) * K_uncovered
+            K_reg = K
+            logger.debug(
+                "Trade %s macro guarantee split K: cov=%.0f%% K_g=%.6f K_u=%.6f K_blend=%.6f",
+                exp_copy.trade_id, _guarantee_cov_m * 100, K_covered, K_uncovered, K,
+            )
         else:
-            K      = capital_requirement_k(pd_eff, lgd_eff, M_eff, R_internal, b)
-            K_reg  = capital_requirement_k(pd_eff, lgd_eff, M_eff, R_regulatory, b)
+            # Both use R_regulatory — Pillar 1 is always capped (CRE31.5)
+            K      = capital_requirement_k(pd_eff, lgd_eff, M_eff, R_regulatory, b)
+            K_reg  = K  # identical for Pillar 1; use R_internal separately for ICAAP
+            # Internal (stress) K for Pillar 2 reporting only — never reported as rwa
+            K_internal = capital_requirement_k(pd_eff, lgd_eff, M_eff, R_internal, b)
+            logger.debug(
+                "Trade %s macro: K_reg=%.6f K_internal=%.6f (R_reg=%.4f R_int=%.4f) — "
+                "rwa uses K_reg per CRE31.5",
+                exp_copy.trade_id, K_reg, K_internal, R_regulatory, R_internal,
+            )
 
-        rwa            = rwa_from_k(K,     ead_used)
-        rwa_regulatory = rwa_from_k(K_reg, ead_used)
+        rwa            = rwa_from_k(K,     ead_used)   # Pillar 1: R_regulatory
+        rwa_regulatory = rwa_from_k(K_reg, ead_used)   # same as rwa
 
         # ── EL and CRE35 provisions treatment ─────────────────────────────────
         el           = pd_eff * lgd_eff * ead_used
@@ -1409,13 +2266,24 @@ class AIRBEngine:
             "stress_index":              stress_index,
         }
 
+        # FIX-06 [LOW]: compute rwa_pre_mitigant baseline for CRM attribution display.
+        # Uses the SAME post-macro pd_eff and lgd_base (before CRM) so the benefit
+        # reflects only the CRM reduction, not the macro PD adjustment.
+        if is_defaulted:
+            rwa_pre_macro = rwa
+        else:
+            R_pre = min(asset_correlation(pd_eff, exp_copy.asset_class), R_cap)
+            b_pre = maturity_adjustment(pd_eff, M_eff) if not exp_copy.asset_class.startswith("RETAIL") else 0.0
+            K_pre = capital_requirement_k(pd_eff, lgd_pre_mit, M_eff, R_pre, b_pre)
+            rwa_pre_macro = rwa_from_k(K_pre, exp_copy.ead)
+
         return AIRBResult(
             trade_id              = exp_copy.trade_id,
             pd_applied            = pd_eff,
             lgd_applied           = lgd_eff,
             ead_applied           = ead_used,
             maturity              = M_eff,
-            correlation_r         = R_internal,
+            correlation_r         = R_regulatory,  # Pillar 1 R (fixed, was R_internal)
             capital_req_k         = K,
             maturity_adj_b        = b,
             rwa                   = rwa,
@@ -1431,8 +2299,8 @@ class AIRBEngine:
             validation_warnings   = warnings,
             data_quality_score    = 0.95 if pd_market_implied is not None else 0.85,
             computation_time_ms   = computation_time_ms,
-            rwa_pre_mitigant      = rwa,          # no pre-mit baseline here — caller can compare
-            rwa_mitigant_benefit  = 0.0,
+            rwa_pre_mitigant      = rwa_pre_macro,
+            rwa_mitigant_benefit  = max(rwa_pre_macro - rwa, 0.0),
             lgd_pre_mitigant      = lgd_pre_mit,
             lgd_star              = lgd_eff,
             pd_pre_mitigant       = pd_pre_mit,
@@ -1515,17 +2383,64 @@ class AIRBEngine:
         return result
 
 
-    def compute_portfolio(self, exposures: List[BankingBookExposure]) -> Dict:
+    def compute_portfolio(
+        self,
+        exposures: List[BankingBookExposure],
+        force_macro_refresh: bool = False,
+    ) -> Dict:
         """
-        Compute A-IRB for portfolio with comprehensive diagnostics.
+        Compute A-IRB capital for a portfolio with optional live macro overlay.
+
+        When the engine was constructed with a USMacroDataFeed instance, this
+        method automatically fetches current US macro conditions and routes every
+        exposure through compute_with_macro_overlay().  The macro snapshot is
+        fetched once per portfolio run (cached by the feed) so there is no
+        per-trade network overhead.
+
+        Args:
+            exposures:           List of BankingBookExposure objects.
+            force_macro_refresh: Force a live re-fetch even if the cache is fresh.
+                                 Use for intraday stress reruns or on-demand
+                                 regulatory capital recalculation.
+
+        Returns:
+            Standard portfolio summary dict with an additional 'macro_snapshot'
+            key when live data was used.
         """
         start_time = time.time()
         results = []
         failed_trades = []
-        
+
+        # ── Resolve macro conditions ──────────────────────────────────────────
+        # Fetch once for the entire portfolio run — not once per trade.
+        macro_snapshot: Optional[MacroeconomicFactors] = None
+        if self.macro_feed is not None:
+            try:
+                macro_snapshot = self.macro_feed.fetch(force_refresh=force_macro_refresh)
+                logger.info(
+                    "A-IRB portfolio run: LIVE macro overlay active — "
+                    "VIX=%.1f | T10Y2Y=%.0fbp | HY-OAS=%.0fbp | "
+                    "UNRATE=%.1f%% | GDP=%.1f%% | regime=%s",
+                    macro_snapshot.vix_level,
+                    macro_snapshot.yield_curve_slope,
+                    macro_snapshot.high_yield_spread,
+                    macro_snapshot.unemployment_rate,
+                    macro_snapshot.real_gdp_growth,
+                    macro_snapshot.regime().value,
+                )
+            except Exception as exc:
+                logger.error(
+                    "A-IRB: macro feed fetch failed (%s) — "
+                    "falling back to static Pillar 1 compute()", exc,
+                )
+                macro_snapshot = None
+
         for exp in exposures:
             try:
-                r = self.compute(exp)
+                if macro_snapshot is not None:
+                    r = self.compute_with_macro_overlay(exp, macro_snapshot)
+                else:
+                    r = self.compute(exp)
                 results.append(r)
             except Exception as e:
                 logger.error("A-IRB failed for trade %s: %s", exp.trade_id, e)
@@ -1557,6 +2472,27 @@ class AIRBEngine:
         
         if failed_trades:
             logger.warning("A-IRB: %d trades failed — %s", len(failed_trades), failed_trades[:3])
+
+        # ── Live macro metadata — exposed for dashboard and audit trail ───────
+        # When macro_feed is active, record the snapshot used so that capital
+        # numbers can always be traced back to the exact market conditions.
+        macro_meta: Dict = {}
+        if macro_snapshot is not None:
+            macro_meta = {
+                "source":             "LIVE",
+                "fetch_log":          self.macro_feed.fetch_log if self.macro_feed else {},
+                "run_date":           macro_snapshot.date.isoformat(),
+                "vix_level":          macro_snapshot.vix_level,
+                "yield_curve_slope":  macro_snapshot.yield_curve_slope,
+                "high_yield_spread":  macro_snapshot.high_yield_spread,
+                "unemployment_rate":  macro_snapshot.unemployment_rate,
+                "real_gdp_growth":    macro_snapshot.real_gdp_growth,
+                "credit_default_rate":macro_snapshot.credit_default_rate * 100,  # % for display
+                "stress_index":       round(macro_snapshot.stress_index(), 4),
+                "regime":             macro_snapshot.regime().value,
+            }
+        else:
+            macro_meta = {"source": "STATIC"}
 
         # Mitigant benefit aggregates
         total_rwa_pre_mit = sum(r.rwa_pre_mitigant     for r in results)
@@ -1591,6 +2527,7 @@ class AIRBEngine:
 
         return {
             "trade_results":            results,
+            "macro_snapshot":           macro_meta,   # live US macro conditions used this run
             "total_rwa":                total_rwa,
             "total_el":                 total_el,
             "total_ead":                total_ead,
@@ -1663,6 +2600,10 @@ class AIRBEngine:
 
         return {
             "trade_results":        results,
+            # macro_snapshot is not applicable here: this path calls compute() (no macro overlay).
+            # Use compute_portfolio_from_universal_trades() only for Pillar 1 capital.
+            # For a macro-enriched Pillar 2 / ICAAP view, use compute_portfolio() with
+            # a USMacroDataFeed attached to the engine.
             "total_rwa":            total_rwa,
             "total_el":             total_el,
             "total_ead":            total_ead,

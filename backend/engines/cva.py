@@ -401,6 +401,14 @@ class CVAInput:
     # Wrong-Way Risk (MAR50.32)
     is_wrong_way:       bool  = False           # True if exposure correlates with PD
     wwr_add_on:         float = 0.0             # Conservative EAD add-on for WWR (% of EAD)
+    # Counterparty location — used by the proxy spread tier-1 lookup (MAR50.32(3))
+    region:             str   = "US"            # 'US' | 'EUR' | 'EM' | etc.
+    # Spread provenance — populated by CVAEngine._enrich_missing_spreads()
+    # 'LIVE'            : credit_spread_bps supplied directly by caller
+    # 'PROXY_SECTOR'    : estimated from sector/credit_quality/region peer table
+    # 'PROXY_INDEX_IG'  : fell back to live IG market index spread
+    # 'PROXY_INDEX_HY'  : fell back to live HY market index spread
+    spread_source:      str   = "LIVE"
 
 @dataclass
 class CVAResult:
@@ -416,6 +424,8 @@ class CVAResult:
     sa_vega_charge:   float = 0.0
     # CVA value estimate
     cva_estimate:     float = 0.0
+    # Spread provenance — mirrors CVAInput.spread_source; 'LIVE' unless proxy was used
+    spread_source:    str   = "LIVE"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BA-CVA (Basic Approach) — MAR50.20–50.38
@@ -515,6 +525,7 @@ def compute_ba_cva(
             rwa_cva         = 0.0,
             ba_sc_charge    = sc,
             cva_estimate    = inp.pd_1yr * lgd * ead_eff * m_eff,
+            spread_source   = getattr(inp, "spread_source", "LIVE"),
         )
 
     logger.debug("BA-CVA: rho=%.2f (supervisory fixed per MAR50.29), rfr=%.3f%%",
@@ -742,6 +753,7 @@ def compute_sa_cva(
             sa_delta_charge = delta_charge,
             sa_vega_charge  = vega_charge,
             cva_estimate    = inp.pd_1yr * lgd * ead_eff * m_eff,
+            spread_source   = getattr(inp, "spread_source", "LIVE"),
         )
 
     return total_delta_rwa + total_vega_rwa, results
@@ -870,6 +882,76 @@ class CVAEngine:
             _mkt.credit_spread_hy,
         )
 
+    def _enrich_missing_spreads(
+        self,
+        inputs: List[CVAInput],
+    ) -> tuple[List[CVAInput], int]:
+        """
+        Fill in credit_spread_bps for counterparties where it is None,
+        using the two-tier proxy cascade required by MAR50.32(3).
+
+        Tier 1 — Sector / credit_quality / region peer lookup
+                  (estimate_proxy_spread: static table calibrated to liquid CDS peers)
+        Tier 2 — Live market index spread from CVAMarketConditions
+                  (CDX IG for IG counterparties; CDX HY for HY / NR counterparties)
+
+        Returns (enriched_inputs, n_enriched) where n_enriched is the count
+        of counterparties that received a proxy spread.  Input objects whose
+        credit_spread_bps is already populated are returned unchanged (no copy
+        is made for those).
+
+        MAR50.32(3) compliance note: the proxy lookup table in
+        estimate_proxy_spread() must be calibrated to live peer CDS data and
+        reviewed at least monthly by the credit desk.  The spread_source field
+        on each enriched CVAInput / CVAResult enables auditors to identify
+        which counterparties used proxy spreads in a given capital run.
+        """
+        import copy as _copy
+        mkt = self.market or CVAMarketConditions()
+        enriched: List[CVAInput] = []
+        n_enriched = 0
+
+        for inp in inputs:
+            if inp.credit_spread_bps is not None:
+                enriched.append(inp)
+                continue
+
+            inp_copy = _copy.copy(inp)   # shallow copy — all fields are value types
+
+            # Tier 1: sector / credit_quality / region peer proxy
+            region = getattr(inp, "region", "US")
+            proxy  = estimate_proxy_spread(inp.sector, inp.credit_quality, region)
+            if proxy is not None:
+                inp_copy.credit_spread_bps = proxy
+                inp_copy.spread_source     = "PROXY_SECTOR"
+                logger.info(
+                    "Spread enriched [T1 PROXY_SECTOR] — %s: %.0f bps "
+                    "(sector=%s  cq=%s  region=%s)  "
+                    "[MAR50.32(3): verify peer calibration is current]",
+                    inp.counterparty_id, proxy,
+                    inp.sector, inp.credit_quality, region,
+                )
+            else:
+                # Tier 2: live market index spread
+                if inp.credit_quality.upper() == "IG":
+                    idx_spread = mkt.credit_spread_ig
+                    source     = "PROXY_INDEX_IG"
+                else:
+                    idx_spread = mkt.credit_spread_hy
+                    source     = "PROXY_INDEX_HY"
+                inp_copy.credit_spread_bps = idx_spread
+                inp_copy.spread_source     = source
+                logger.info(
+                    "Spread enriched [T2 %s] — %s: %.0f bps "
+                    "(no sector peer found — using market index spread)",
+                    source, inp.counterparty_id, idx_spread,
+                )
+
+            enriched.append(inp_copy)
+            n_enriched += 1
+
+        return enriched, n_enriched
+
     def _check_sa_eligibility(self, inp: CVAInput) -> tuple[bool, Optional[str]]:
         """Returns (eligible, fallback_trace_code)."""
         if not self.sa_approved:
@@ -949,10 +1031,23 @@ class CVAEngine:
                 "method": "CCR_PROXY",
             }
 
+        # Enrich missing credit spreads before eligibility check (MAR50.32(3)).
+        # Counterparties with no live CDS spread receive a proxy estimated from
+        # sector/credit_quality/region peers (Tier 1) or the live IG/HY market
+        # index spread (Tier 2).  This allows them to be routed to SA-CVA instead
+        # of automatically falling back to BA-CVA due to a data gap alone.
+        enriched_inputs, n_enriched = self._enrich_missing_spreads(inputs)
+        if n_enriched > 0:
+            logger.info(
+                "Spread enrichment: %d/%d counterparties received proxy spreads "
+                "(MAR50.32(3) — ensure proxy lookup table is calibrated to live peers)",
+                n_enriched, len(inputs),
+            )
+
         # Classify each counterparty
         sa_inputs, ba_inputs, traces = [], [], []
 
-        for inp in inputs:
+        for inp in enriched_inputs:
             eligible, trace = self._check_sa_eligibility(inp)
             if eligible:
                 sa_inputs.append(inp)
@@ -988,13 +1083,23 @@ class CVAEngine:
             total_rwa += ba_rwa
             logger.info("BA-CVA: %d counterparties, RWA=%.0f", len(ba_inputs), ba_rwa)
 
-        logger.info("CVA total RWA=%.0f (%d SA, %d BA, %d traces)",
-                    total_rwa, len(sa_inputs), len(ba_inputs), len(traces))
+        proxy_spread_cptys = [
+            inp.counterparty_id for inp in enriched_inputs
+            if getattr(inp, "spread_source", "LIVE") != "LIVE"
+        ]
+        logger.info(
+            "CVA total RWA=%.0f (%d SA, %d BA, %d traces, %d proxy spreads: %s)",
+            total_rwa, len(sa_inputs), len(ba_inputs), len(traces),
+            n_enriched, proxy_spread_cptys or "none",
+        )
 
         return {
-            "total_rwa_cva":  total_rwa,
-            "method_summary": all_results,
-            "fallback_traces": traces,
-            "method":         "MIXED" if sa_inputs and ba_inputs else
-                              ("SA_CVA" if sa_inputs else "BA_CVA"),
+            "total_rwa_cva":               total_rwa,
+            "method_summary":              all_results,
+            "fallback_traces":             traces,
+            "method":                      "MIXED" if sa_inputs and ba_inputs else
+                                           ("SA_CVA" if sa_inputs else "BA_CVA"),
+            # Spread enrichment audit trail (MAR50.32(3))
+            "spread_enriched_count":       n_enriched,
+            "proxy_spread_counterparties": proxy_spread_cptys,
         }

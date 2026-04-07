@@ -20,6 +20,7 @@ from typing import List, Dict, Optional
 
 from backend.engines.cva import CVAInput
 from backend.engines.ccp import CCPExposure
+from backend.data_generators.portfolio_generator import pd_from_rating
 
 # Counterparty-level spread availability — mirrors the universe in portfolio_generator.py
 # True = CDS spread data available → SA-CVA eligible
@@ -43,16 +44,17 @@ _MARKET_SPREADS_BPS: Dict[str, float] = {
     "CPTY-0006": 65.0,   # BNP ~65bp
 }
 
-# PD and LGD per counterparty — aligned with portfolio_generator.py universe
+# PD is now derived from the rating transition matrix via pd_from_rating();
+# only lgd_mkt, rating, and maturity are needed here.
 _COUNTERPARTY_PARAMS: Dict[str, Dict] = {
-    "CPTY-0001": {"pd": 0.0010, "lgd_mkt": 0.40, "rating": "A+",  "maturity": 3.0},
-    "CPTY-0002": {"pd": 0.0025, "lgd_mkt": 0.40, "rating": "BBB", "maturity": 4.0},
-    "CPTY-0003": {"pd": 0.0003, "lgd_mkt": 0.40, "rating": "AA+", "maturity": 2.5},
-    "CPTY-0004": {"pd": 0.0008, "lgd_mkt": 0.40, "rating": "A",   "maturity": 3.5},
-    "CPTY-0005": {"pd": 0.0001, "lgd_mkt": 0.45, "rating": "AAA", "maturity": 5.0},
-    "CPTY-0006": {"pd": 0.0015, "lgd_mkt": 0.40, "rating": "A-",  "maturity": 3.0},
-    "CPTY-0007": {"pd": 0.0007, "lgd_mkt": 0.40, "rating": "A+",  "maturity": 2.0},
-    "CPTY-0008": {"pd": 0.0150, "lgd_mkt": 0.45, "rating": "BB",  "maturity": 2.5},
+    "CPTY-0001": {"lgd_mkt": 0.40, "rating": "A+",  "maturity": 3.0},
+    "CPTY-0002": {"lgd_mkt": 0.40, "rating": "BBB", "maturity": 4.0},
+    "CPTY-0003": {"lgd_mkt": 0.40, "rating": "AA+", "maturity": 2.5},
+    "CPTY-0004": {"lgd_mkt": 0.40, "rating": "A",   "maturity": 3.5},
+    "CPTY-0005": {"lgd_mkt": 0.45, "rating": "AAA", "maturity": 5.0},
+    "CPTY-0006": {"lgd_mkt": 0.40, "rating": "A-",  "maturity": 3.0},
+    "CPTY-0007": {"lgd_mkt": 0.40, "rating": "A+",  "maturity": 2.0},
+    "CPTY-0008": {"lgd_mkt": 0.45, "rating": "BB",  "maturity": 2.5},
 }
 
 
@@ -97,7 +99,7 @@ def build_cva_inputs(
 
     for cpty_id, total_ead in ead_by_cpty.items():
         params = _COUNTERPARTY_PARAMS.get(cpty_id, {
-            "pd": 0.005, "lgd_mkt": 0.40, "rating": "NR", "maturity": 2.5
+            "lgd_mkt": 0.40, "rating": "NR", "maturity": 2.5
         })
 
         has_spread = _SPREAD_AVAILABLE.get(cpty_id, False)
@@ -113,7 +115,7 @@ def build_cva_inputs(
             counterparty_id  = cpty_id,
             netting_set_id   = f"NET-{cpty_id}-AGG",
             ead              = total_ead,
-            pd_1yr           = params["pd"],
+            pd_1yr           = pd_from_rating(params["rating"], params["maturity"]),
             lgd_mkt          = params["lgd_mkt"],
             maturity_years   = params["maturity"],
             credit_spread_bps= spread_bps,
