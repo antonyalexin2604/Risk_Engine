@@ -953,7 +953,15 @@ class CVAEngine:
         return enriched, n_enriched
 
     def _check_sa_eligibility(self, inp: CVAInput) -> tuple[bool, Optional[str]]:
-        """Returns (eligible, fallback_trace_code)."""
+        """
+        Returns (eligible, fallback_trace_code).
+        
+        SA-CVA requires live, liquid credit spread data per MAR50.40+.
+        Proxy spreads (sector lookup or index fallback) do not meet the
+        sensitivity-based approach's data quality requirements.
+        
+        Only counterparties with spread_source='LIVE' qualify for SA-CVA.
+        """
         if not self.sa_approved:
             trace = (f"FALLBACK|{inp.counterparty_id}|NO_SA_APPROVAL"
                      f"|{CVA_FALLBACK_REASONS['NO_SA_APPROVAL']}")
@@ -961,6 +969,13 @@ class CVAEngine:
         if inp.credit_spread_bps is None:
             trace = (f"FALLBACK|{inp.counterparty_id}|MISSING_SPREADS"
                      f"|{CVA_FALLBACK_REASONS['MISSING_SPREADS']}")
+            return False, trace
+        # Reject proxy spreads for SA-CVA (MAR50.40: requires observable credit spreads)
+        spread_source = getattr(inp, "spread_source", "LIVE")
+        if spread_source != "LIVE":
+            trace = (f"FALLBACK|{inp.counterparty_id}|PROXY_SPREAD_QUALITY"
+                     f"|SA-CVA requires live market spreads; proxy spread "
+                     f"(source={spread_source}) insufficient for sensitivity-based approach")
             return False, trace
         return True, None
 

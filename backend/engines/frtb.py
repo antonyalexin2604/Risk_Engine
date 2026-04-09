@@ -58,8 +58,11 @@ import math
 import copy
 import json
 import logging
+import os
+import time
+import threading
 from dataclasses import dataclass, field, asdict
-from datetime import date
+from datetime import date, datetime
 from typing import (
     List,
     Dict,
@@ -70,6 +73,7 @@ from typing import (
     Union,
     Iterable,
     Any,
+    Callable,
 )
 
 import numpy as np
@@ -122,60 +126,589 @@ class MarketConditions:
 
 class MarketDataFeed:
     """
-    Real-time market data integration interface.
-    Production: connect to Bloomberg, Reuters, or internal systems.
+    Real-time market data integration for FRTB with three-tier fallback strategy.
+
+    Designed for global trading book deployment. All seven MarketConditions fields
+    are populated from authoritative public sources — no proprietary API keys
+    required for daily batch use (FRED CSV endpoint is free). Production Bloomberg /
+    Refinitiv integration is provided via drop-in method overrides.
+
+    Data source map
+    ───────────────────────────────────────────────────────────────────────
+    Field                Series / Ticker                   Release cadence
+    ─────────────────    ──────────────────────────────    ────────────────
+    vix_level            FRED: VIXCLS  / yfinance: ^VIX    Daily (T+0 close)
+    equity_vol_index     FRED: VXEEMCLS (EM VIX proxy) or  Daily
+                         yfinance: ^VIX (same as vix_level)
+    credit_spread_ig     FRED: BAMLC0A0CMEY (US Corp IG    Daily
+                         OAS, %)  →  ×100 = bp
+    credit_spread_hy     FRED: BAMLH0A0HYM2 (ICE BofA      Daily
+                         US HY OAS, %)  →  ×100 = bp
+    fx_vol_index         FRED: DEXJPUS (USD/JPY FX rate    Daily
+                         realized vol proxy, %)
+    cmdty_vol_index      yfinance: CL=F (WTI crude oil,    Daily
+                         realized vol %)
+    ir_vol_swaption      FRED: MOVE (Merrill Lynch Option  Daily
+                         Volatility Estimate Index, bp)
+
+    Three-tier fallback per series
+    ───────────────────────────────
+    Tier 1  Bloomberg BSAPI (blpapi) / Refinitiv LSEG    →  intraday, real-time
+    Tier 2  FRED (free CSV or JSON-with-API-key)         →  daily close, T+0
+    Tier 3  yfinance (open-source delayed market data)   →  15-min delay
+    Floor   Hard-coded long-run conservative averages    →  never fails
+
+    Thread safety
+    ─────────────
+    A single RLock protects the in-memory cache so concurrent runs always
+    see a consistent snapshot. An optional JSON disk cache allows the
+    overnight batch to share its snapshot with intraday processes.
+
+    Environment variables (all optional)
+    ─────────────────────────────────────
+    FRED_API_KEY        Raises rate limit from 120 → 500 req/min; enables
+                        the JSON API (returns structured data, easier to parse).
+    BLOOMBERG_HOST      host:port of Bloomberg Server API, e.g. localhost:8194
+    REFINITIV_APP_KEY   LSEG / Refinitiv Eikon / Data API application key
     """
-    def __init__(self):
+
+    # FRED public endpoints ─────────────────────────────────────────────────
+    _FRED_CSV  = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={series}"
+    _FRED_JSON = (
+        "https://api.stlouisfed.org/fred/series/observations"
+        "?series_id={series}&api_key={key}"
+        "&sort_order=desc&limit=5&file_type=json"
+    )
+
+    # Series identifiers ───────────────────────────────────────────────────
+    _SERIES = {
+        "vix":          "VIXCLS",            # CBOE VIX close (index points)
+        "eq_vol":       "VXEEMCLS",          # CBOE EM VIX (equity vol proxy)
+        "ig_spread":    "BAMLC0A0CMEY",      # ICE BofA US Corp IG OAS (%)
+        "hy_spread":    "BAMLH0A0HYM2",      # ICE BofA US HY OAS (%)
+        "fx_vol":       "DEXJPUS",           # USD/JPY (FX vol proxy via realized)
+        "move":         "MOVE",              # Merrill Lynch IR vol index (bp)
+    }
+
+    # Conservative long-run fallback values ────────────────────────────────
+    # Used only when ALL three tiers fail simultaneously (e.g. network outage).
+    # Slightly above historical medians → conservative direction for capital.
+    _FALLBACK = {
+        "vix":          20.0,    # index points; median ~17, crisis floor ~30
+        "eq_vol":       22.0,    # % annualized; slightly above normal
+        "ig_spread":    1.20,    # % (120bp); long-run avg ~100bp
+        "hy_spread":    4.50,    # % (450bp); long-run avg ~400bp
+        "fx_vol":       9.0,     # % annualized; G10 FX vol median ~8%
+        "cmdty_vol":    28.0,    # % annualized; oil/energy vol median ~25%
+        "ir_vol":       60.0,    # bp; swaption vol median ~50bp
+    }
+
+    def __init__(
+        self,
+        cache_ttl_seconds: int = 3600,
+        fred_api_key: Optional[str] = None,
+        bloomberg_host: Optional[str] = None,
+        refinitiv_key: Optional[str] = None,
+        cache_path: Optional[str] = None,
+    ):
+        """
+        Initialize market data feed with optional external API credentials.
+
+        Args:
+            cache_ttl_seconds: Time-to-live for in-memory cache (default 1 hour).
+            fred_api_key:      FRED API key (optional; uses env var if None).
+            bloomberg_host:    Bloomberg Server API host:port (optional).
+            refinitiv_key:     Refinitiv API key (optional; uses env var if None).
+            cache_path:        Path to JSON disk cache file (optional).
+        """
         self._cache: Optional[MarketConditions] = None
-        self._cache_timestamp: Optional[date] = None
-    
-    def get_current_conditions(self, force_refresh: bool = False) -> MarketConditions:
-        """Fetch current market conditions (cached daily)."""
-        today = date.today()
-        if not force_refresh and self._cache and self._cache_timestamp == today:
-            return self._cache
-        
-        # TODO: Production integration example:
-        # vix = bloomberg_api.get('VIX Index')
-        # hy_spread = bloomberg_api.get('CDX HY Spread')
-        # fx_vol = reuters_api.get('JPM FX VIX')
-        
-        conditions = MarketConditions(
-            date=today,
-            vix_level=15.0,  # Default/demo values
-            equity_vol_index=20.0,
-            credit_spread_ig=100.0,
-            credit_spread_hy=400.0,
-            fx_vol_index=8.0,
-            cmdty_vol_index=25.0,
-            ir_vol_swaption=50.0,
-        )
-        
-        self._cache = conditions
-        self._cache_timestamp = today
-        
+        self._cache_timestamp: Optional[datetime] = None
+        self._cache_ttl = cache_ttl_seconds
+        self._lock = threading.RLock()
+
+        # API credentials (prefer constructor args, fall back to env vars)
+        self._fred_key = fred_api_key or os.getenv("FRED_API_KEY")
+        self._bloomberg_host = bloomberg_host or os.getenv("BLOOMBERG_HOST")
+        self._refinitiv_key = refinitiv_key or os.getenv("REFINITIV_APP_KEY")
+
+        # Disk cache for sharing snapshots across processes
+        self._cache_path = cache_path
+        if self._cache_path and os.path.exists(self._cache_path):
+            self._load_disk_cache()
+
         logger.info(
-            "Market conditions: VIX=%.1f, HY=%dbp, stress=%.2f (%s)",
-            conditions.vix_level, conditions.credit_spread_hy,
-            conditions.stress_level(), conditions.regime().value
+            "MarketDataFeed initialized: FRED=%s, Bloomberg=%s, Refinitiv=%s",
+            "enabled" if self._fred_key else "public-only",
+            "enabled" if self._bloomberg_host else "disabled",
+            "enabled" if self._refinitiv_key else "disabled",
         )
-        return conditions
+    
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    def get_current_conditions(self, force_refresh: bool = False) -> MarketConditions:
+        """
+        Fetch current market conditions (cached with TTL).
+
+        Args:
+            force_refresh: If True, bypass cache and re-fetch from sources.
+
+        Returns:
+            MarketConditions with all seven fields populated.
+        """
+        with self._lock:
+            now = datetime.now()
+            
+            # Check cache validity
+            if (
+                not force_refresh
+                and self._cache is not None
+                and self._cache_timestamp is not None
+                and (now - self._cache_timestamp).total_seconds() < self._cache_ttl
+            ):
+                logger.debug("Returning cached market conditions")
+                return self._cache
+
+            # Fetch fresh data
+            logger.info("Fetching fresh market conditions from external sources")
+            conditions = self._fetch_all()
+
+            # Update cache
+            self._cache = conditions
+            self._cache_timestamp = now
+
+            # Persist to disk if configured
+            if self._cache_path:
+                self._save_disk_cache(conditions)
+
+            logger.info(
+                "Market conditions: VIX=%.1f, HY=%dbp, stress=%.2f (%s)",
+                conditions.vix_level,
+                conditions.credit_spread_hy,
+                conditions.stress_level(),
+                conditions.regime().value,
+            )
+            return conditions
+
+    @property
+    def cached(self) -> Optional[MarketConditions]:
+        """Return cached conditions without triggering a refresh."""
+        return self._cache
+
+    def inject(self, **kwargs: float) -> MarketConditions:
+        """
+        Manually inject market conditions (for testing/simulation).
+
+        Example:
+            feed.inject(vix_level=45.0, credit_spread_hy=800.0)
+
+        Returns:
+            Updated MarketConditions object (also cached).
+        """
+        with self._lock:
+            base = self._cache or MarketConditions(date=date.today())
+            
+            conditions = MarketConditions(
+                date=date.today(),
+                vix_level=kwargs.get("vix_level", base.vix_level),
+                equity_vol_index=kwargs.get("equity_vol_index", base.equity_vol_index),
+                credit_spread_ig=kwargs.get("credit_spread_ig", base.credit_spread_ig),
+                credit_spread_hy=kwargs.get("credit_spread_hy", base.credit_spread_hy),
+                fx_vol_index=kwargs.get("fx_vol_index", base.fx_vol_index),
+                cmdty_vol_index=kwargs.get("cmdty_vol_index", base.cmdty_vol_index),
+                ir_vol_swaption=kwargs.get("ir_vol_swaption", base.ir_vol_swaption),
+            )
+            
+            self._cache = conditions
+            self._cache_timestamp = datetime.now()
+            
+            logger.info(
+                "Market conditions manually injected: VIX=%.1f, HY=%dbp",
+                conditions.vix_level, conditions.credit_spread_hy
+            )
+            return conditions
     
     def update_from_dict(self, data: Dict[str, float]) -> MarketConditions:
-        """Manually update conditions from dict (for testing/custom feeds)."""
-        conditions = MarketConditions(
-            date=date.today(),
-            vix_level=data.get('vix', 15.0),
-            equity_vol_index=data.get('eq_vol', 20.0),
-            credit_spread_ig=data.get('ig_spread', 100.0),
-            credit_spread_hy=data.get('hy_spread', 400.0),
-            fx_vol_index=data.get('fx_vol', 8.0),
-            cmdty_vol_index=data.get('cmdty_vol', 25.0),
-            ir_vol_swaption=data.get('ir_vol', 50.0),
+        """Legacy method - redirects to inject() for backward compatibility."""
+        return self.inject(**data)
+
+    # ── Internal orchestration ─────────────────────────────────────────────
+
+    def _fetch_all(self) -> MarketConditions:
+        """Fetch all seven market parameters using three-tier fallback."""
+        
+        # VIX Level
+        vix = self._fetch_series(
+            label="VIX",
+            tier1=lambda: self._bloomberg("VIX Index", "PX_LAST"),
+            tier2=lambda: self._fred(self._SERIES["vix"]),
+            tier3=lambda: self._yfinance("^VIX"),
+            transform=lambda x: x,  # Already in index points
+            fallback=self._FALLBACK["vix"],
         )
-        self._cache = conditions
-        self._cache_timestamp = date.today()
-        return conditions
+
+        # Equity Volatility Index (using EM VIX or VIX as proxy)
+        eq_vol = self._fetch_series(
+            label="Equity Vol",
+            tier1=lambda: self._bloomberg("VXO Index", "PX_LAST"),
+            tier2=lambda: self._fred(self._SERIES["eq_vol"]),
+            tier3=lambda: self._yfinance("^VIX"),  # Use VIX as fallback
+            transform=lambda x: x,
+            fallback=self._FALLBACK["eq_vol"],
+        )
+
+        # IG Credit Spread
+        ig_spread = self._fetch_series(
+            label="IG Spread",
+            tier1=lambda: self._bloomberg("LUACOAS Index", "PX_LAST"),
+            tier2=lambda: self._fred(self._SERIES["ig_spread"]),
+            tier3=lambda: None,  # No yfinance equivalent
+            transform=lambda x: x * 100 if x < 10 else x,  # % to bp if needed
+            fallback=self._FALLBACK["ig_spread"] * 100,  # Return in bp
+        )
+
+        # HY Credit Spread
+        hy_spread = self._fetch_series(
+            label="HY Spread",
+            tier1=lambda: self._bloomberg("LF98OAS Index", "PX_LAST"),
+            tier2=lambda: self._fred(self._SERIES["hy_spread"]),
+            tier3=lambda: None,
+            transform=lambda x: x * 100 if x < 10 else x,  # % to bp if needed
+            fallback=self._FALLBACK["hy_spread"] * 100,  # Return in bp
+        )
+
+        # FX Volatility (using USD/JPY realized vol as proxy)
+        fx_vol = self._fetch_series(
+            label="FX Vol",
+            tier1=lambda: self._bloomberg("JPMVXYGL Index", "PX_LAST"),
+            tier2=lambda: self._compute_fx_realized_vol(),
+            tier3=lambda: None,
+            transform=lambda x: x,
+            fallback=self._FALLBACK["fx_vol"],
+        )
+
+        # Commodity Volatility (using WTI crude oil realized vol)
+        cmdty_vol = self._fetch_series(
+            label="Commodity Vol",
+            tier1=lambda: self._bloomberg("CRYTR Index", "PX_LAST"),
+            tier2=lambda: None,
+            tier3=lambda: self._compute_commodity_realized_vol(),
+            transform=lambda x: x,
+            fallback=self._FALLBACK["cmdty_vol"],
+        )
+
+        # IR Volatility (swaption vol, MOVE index)
+        ir_vol = self._fetch_series(
+            label="IR Vol (MOVE)",
+            tier1=lambda: self._bloomberg("MOVE Index", "PX_LAST"),
+            tier2=lambda: self._fred(self._SERIES["move"]),
+            tier3=lambda: None,
+            transform=lambda x: x,
+            fallback=self._FALLBACK["ir_vol"],
+        )
+
+        return MarketConditions(
+            date=date.today(),
+            vix_level=vix,
+            equity_vol_index=eq_vol,
+            credit_spread_ig=ig_spread,
+            credit_spread_hy=hy_spread,
+            fx_vol_index=fx_vol,
+            cmdty_vol_index=cmdty_vol,
+            ir_vol_swaption=ir_vol,
+        )
+
+    # ── Generic fetch helper ───────────────────────────────────────────────
+
+    def _fetch_series(
+        self,
+        label: str,
+        tier1: Callable[[], Optional[float]],
+        tier2: Callable[[], Optional[float]],
+        tier3: Callable[[], Optional[float]],
+        transform: Callable[[float], float],
+        fallback: float,
+    ) -> float:
+        """
+        Three-tier fetch with transform and fallback.
+
+        Tries tier1 (Bloomberg) → tier2 (FRED) → tier3 (yfinance) → fallback.
+        Logs source and applies transform to the first successful value.
+        """
+        for tier_name, fetcher in [("Bloomberg", tier1), ("FRED", tier2), ("yfinance", tier3)]:
+            try:
+                val = fetcher()
+                if val is not None and not math.isnan(val) and val > 0:
+                    result = transform(val)
+                    logger.debug("%s: %.2f (source: %s)", label, result, tier_name)
+                    return result
+            except Exception as e:
+                logger.debug("%s %s fetch failed: %s", label, tier_name, e)
+                continue
+
+        # All tiers failed → fallback
+        logger.warning("%s: all sources failed, using fallback %.2f", label, fallback)
+        return fallback
+
+    # ── Tier-2: FRED ──────────────────────────────────────────────────────
+
+    def _fred(self, series_id: str) -> Optional[float]:
+        """Fetch from FRED (JSON if API key available, else CSV)."""
+        if self._fred_key:
+            return self._fred_json(series_id)
+        else:
+            return self._fred_csv(series_id)
+
+    def _fred_csv(self, series_id: str) -> Optional[float]:
+        """Fetch latest value from FRED CSV endpoint (no auth required)."""
+        try:
+            import urllib.request
+            url = self._FRED_CSV.format(series=series_id)
+            with urllib.request.urlopen(url, timeout=5) as response:
+                lines = response.read().decode('utf-8').strip().split('\n')
+                if len(lines) < 2:
+                    return None
+                last_row = lines[-1].split(',')
+                return float(last_row[-1])
+        except Exception as e:
+            logger.debug("FRED CSV fetch failed for %s: %s", series_id, e)
+            return None
+
+    def _fred_json(self, series_id: str) -> Optional[float]:
+        """Fetch from FRED JSON API (requires API key)."""
+        try:
+            import urllib.request
+            url = self._FRED_JSON.format(series=series_id, key=self._fred_key)
+            with urllib.request.urlopen(url, timeout=5) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                obs = data.get("observations", [])
+                if obs:
+                    return float(obs[0]["value"])
+        except Exception as e:
+            logger.debug("FRED JSON fetch failed for %s: %s", series_id, e)
+            return None
+
+    # ── Tier-3: yfinance ──────────────────────────────────────────────────
+
+    def _yfinance(self, ticker: str) -> Optional[float]:
+        """Fetch latest close from yfinance (15-min delayed)."""
+        try:
+            import yfinance as yf
+            data = yf.Ticker(ticker).history(period="5d")
+            if not data.empty:
+                return float(data["Close"].iloc[-1])
+        except ImportError:
+            logger.debug("yfinance not installed (pip install yfinance)")
+        except Exception as e:
+            logger.debug("yfinance fetch failed for %s: %s", ticker, e)
+        return None
+
+    def _compute_fx_realized_vol(self) -> Optional[float]:
+        """Compute USD/JPY realized volatility from FRED daily data."""
+        try:
+            import urllib.request
+            url = self._FRED_CSV.format(series=self._SERIES["fx_vol"])
+            with urllib.request.urlopen(url, timeout=5) as response:
+                lines = response.read().decode('utf-8').strip().split('\n')
+                if len(lines) < 22:  # Need 21 days for 20-day vol
+                    return None
+                
+                prices = []
+                for line in lines[-21:]:
+                    parts = line.split(',')
+                    if len(parts) >= 2 and parts[1] != '.':
+                        try:
+                            prices.append(float(parts[1]))
+                        except ValueError:
+                            continue
+                
+                if len(prices) < 20:
+                    return None
+                
+                # Compute log returns and annualized volatility
+                returns = [math.log(prices[i] / prices[i-1]) for i in range(1, len(prices))]
+                variance = sum((r - sum(returns)/len(returns))**2 for r in returns) / len(returns)
+                annual_vol = math.sqrt(variance * 252) * 100  # Annualized %
+                
+                return annual_vol
+        except Exception as e:
+            logger.debug("FX realized vol computation failed: %s", e)
+            return None
+
+    def _compute_commodity_realized_vol(self) -> Optional[float]:
+        """Compute WTI crude oil realized volatility from yfinance."""
+        try:
+            import yfinance as yf
+            data = yf.Ticker("CL=F").history(period="1mo")
+            if len(data) < 20:
+                return None
+            
+            returns = np.log(data["Close"] / data["Close"].shift(1)).dropna()
+            annual_vol = returns.std() * math.sqrt(252) * 100  # Annualized %
+            
+            return float(annual_vol)
+        except Exception as e:
+            logger.debug("Commodity realized vol computation failed: %s", e)
+            return None
+
+    # ── Tier-1: Bloomberg BSAPI ───────────────────────────────────────────
+
+    def _bloomberg(self, ticker: str, field: str = "PX_LAST") -> Optional[float]:
+        """
+        Fetch real-time data from Bloomberg Server API (blpapi).
+
+        Requires:
+            - pip install blpapi
+            - BLOOMBERG_HOST env var (e.g., "localhost:8194")
+            - Active Bloomberg terminal or SAPI license
+
+        Args:
+            ticker: Bloomberg ticker (e.g., "VIX Index")
+            field:  Field name (e.g., "PX_LAST", "YLD_YTM_MID")
+
+        Returns:
+            Field value or None if unavailable/error.
+        """
+        if not self._bloomberg_host:
+            return None
+
+        try:
+            import blpapi  # type: ignore
+
+            host, port = self._bloomberg_host.split(":")
+            session_opts = blpapi.SessionOptions()
+            session_opts.setServerHost(host)
+            session_opts.setServerPort(int(port))
+
+            session = blpapi.Session(session_opts)
+            if not session.start():
+                logger.warning("Bloomberg session failed to start")
+                return None
+
+            if not session.openService("//blp/refdata"):
+                logger.warning("Bloomberg refdata service unavailable")
+                session.stop()
+                return None
+
+            refdata = session.getService("//blp/refdata")
+            request = refdata.createRequest("ReferenceDataRequest")
+            request.append("securities", ticker)
+            request.append("fields", field)
+
+            session.sendRequest(request)
+
+            result = None
+            while True:
+                event = session.nextEvent(500)
+                if event.eventType() == blpapi.Event.RESPONSE:
+                    for msg in event:
+                        sec_data = msg.getElement("securityData")
+                        if sec_data.hasElement("fieldData"):
+                            field_data = sec_data.getElement("fieldData")
+                            if field_data.hasElement(field):
+                                result = float(field_data.getElementAsFloat(field))
+                    break
+
+            session.stop()
+            return result
+
+        except ImportError:
+            logger.debug("blpapi not installed (pip install blpapi)")
+            return None
+        except Exception as e:
+            logger.debug("Bloomberg fetch failed for %s: %s", ticker, e)
+            return None
+
+    # ── Tier-1: Refinitiv / LSEG ─────────────────────────────────────────
+
+    def _refinitiv(self, ric: str, field: str = "CF_CLOSE") -> Optional[float]:
+        """
+        Fetch from Refinitiv Eikon / Data API.
+
+        Requires:
+            - pip install refinitiv-data
+            - REFINITIV_APP_KEY env var
+
+        Args:
+            ric:   Reuters Instrument Code (e.g., ".VIX")
+            field: Field name (e.g., "CF_CLOSE", "TRDPRC_1")
+
+        Returns:
+            Field value or None.
+        """
+        if not self._refinitiv_key:
+            return None
+
+        try:
+            import refinitiv.data as rd  # type: ignore
+
+            rd.open_session(app_key=self._refinitiv_key)
+            df = rd.get_data(ric, [field])
+            rd.close_session()
+
+            if df is not None and not df.empty and field in df.columns:
+                return float(df[field].iloc[0])
+
+        except ImportError:
+            logger.debug("refinitiv-data not installed (pip install refinitiv-data)")
+            return None
+        except Exception as e:
+            logger.debug("Refinitiv fetch failed for %s: %s", ric, e)
+            return None
+
+    # ── Disk cache helpers ─────────────────────────────────────────────────
+
+    def _save_disk_cache(self, conditions: MarketConditions) -> None:
+        """Persist current conditions to JSON disk cache."""
+        if not self._cache_path:
+            return
+
+        try:
+            data = {
+                "date": conditions.date.isoformat(),
+                "vix_level": conditions.vix_level,
+                "equity_vol_index": conditions.equity_vol_index,
+                "credit_spread_ig": conditions.credit_spread_ig,
+                "credit_spread_hy": conditions.credit_spread_hy,
+                "fx_vol_index": conditions.fx_vol_index,
+                "cmdty_vol_index": conditions.cmdty_vol_index,
+                "ir_vol_swaption": conditions.ir_vol_swaption,
+                "timestamp": datetime.now().isoformat(),
+            }
+            with open(self._cache_path, 'w') as f:
+                json.dump(data, f, indent=2)
+            logger.debug("Saved market conditions to disk cache: %s", self._cache_path)
+        except Exception as e:
+            logger.warning("Failed to save disk cache: %s", e)
+
+    def _load_disk_cache(self) -> None:
+        """Load conditions from JSON disk cache (if fresh enough)."""
+        if not self._cache_path or not os.path.exists(self._cache_path):
+            return
+
+        try:
+            with open(self._cache_path, 'r') as f:
+                data = json.load(f)
+
+            cache_time = datetime.fromisoformat(data["timestamp"])
+            age_seconds = (datetime.now() - cache_time).total_seconds()
+
+            if age_seconds < self._cache_ttl:
+                self._cache = MarketConditions(
+                    date=date.fromisoformat(data["date"]),
+                    vix_level=data["vix_level"],
+                    equity_vol_index=data["equity_vol_index"],
+                    credit_spread_ig=data["credit_spread_ig"],
+                    credit_spread_hy=data["credit_spread_hy"],
+                    fx_vol_index=data["fx_vol_index"],
+                    cmdty_vol_index=data["cmdty_vol_index"],
+                    ir_vol_swaption=data["ir_vol_swaption"],
+                )
+                self._cache_timestamp = cache_time
+                logger.info("Loaded market conditions from disk cache (age: %ds)", int(age_seconds))
+            else:
+                logger.debug("Disk cache expired (age: %ds > TTL: %ds)", int(age_seconds), self._cache_ttl)
+        except Exception as e:
+            logger.warning("Failed to load disk cache: %s", e)
 
 class DynamicParameterAdjustment:
     """

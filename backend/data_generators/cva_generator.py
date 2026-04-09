@@ -20,7 +20,7 @@ from typing import List, Dict, Optional
 
 from backend.engines.cva import CVAInput
 from backend.engines.ccp import CCPExposure
-from backend.data_generators.portfolio_generator import pd_from_rating
+from backend.data_sources.credit_calibration import pd_from_rating
 
 # Counterparty-level spread availability — mirrors the universe in portfolio_generator.py
 # True = CDS spread data available → SA-CVA eligible

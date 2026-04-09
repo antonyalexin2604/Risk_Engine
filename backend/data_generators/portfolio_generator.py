@@ -29,15 +29,14 @@ from __future__ import annotations
 import logging
 import random
 import math
-from functools import lru_cache as _lru_cache
 from datetime import date, timedelta
-import numpy as _np
 from backend.data_sources.market_state import compute_trade_mtm
 from typing import List, Dict, Tuple
 from dataclasses import dataclass, field
 
 from backend.engines.sa_ccr import Trade, NettingSet
 from backend.engines.a_irb import BankingBookExposure
+from backend.data_sources.credit_calibration import pd_from_rating  # RTM-based PD
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scale Configuration  ← edit these to expand the portfolio universe
@@ -80,118 +79,6 @@ COUNTERPARTIES = [
     {"id": "CPTY-0020", "name": "Republic of France",              "sector": "Sovereign", "rating": "AA",   "country": "FR"},
     {"id": "CPTY-0008", "name": "Brazil — Republic of",            "sector": "Sovereign", "rating": "BB",   "country": "BR"},
 ]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Rating Transition Matrix  (S&P Global – Annual Default Study, corporate avg)
-# ─────────────────────────────────────────────────────────────────────────────
-# Eight broad S&P-style categories; the last state ("D") is absorbing.
-_RTM_CATEGORIES: List[str]     = ["AAA", "AA", "A", "BBB", "BB", "B", "CCC", "D"]
-_RTM_CAT_IDX:    Dict[str, int] = {r: i for i, r in enumerate(_RTM_CATEGORIES)}
-
-# 1-year corporate average transition matrix  (rows = FROM, cols = TO).
-# Source: S&P Global Ratings Annual Default Study 2022 — NR category
-# redistributed proportionally; every row sums exactly to 1.0.
-_RTM_1Y: _np.ndarray = _np.array([
-    #  AAA      AA       A        BBB      BB       B        CCC      D
-    [0.9081,  0.0833,  0.0068,  0.0006,  0.0012,  0.0000,  0.0000,  0.0000],  # AAA
-    [0.0070,  0.9065,  0.0779,  0.0064,  0.0006,  0.0014,  0.0002,  0.0000],  # AA
-    [0.0009,  0.0227,  0.9105,  0.0552,  0.0074,  0.0026,  0.0001,  0.0006],  # A
-    [0.0002,  0.0033,  0.0595,  0.8693,  0.0530,  0.0117,  0.0012,  0.0018],  # BBB
-    [0.0003,  0.0014,  0.0067,  0.0773,  0.8053,  0.0884,  0.0100,  0.0106],  # BB
-    [0.0000,  0.0011,  0.0024,  0.0043,  0.0648,  0.8346,  0.0407,  0.0521],  # B
-    [0.0011,  0.0000,  0.0037,  0.0118,  0.0241,  0.1375,  0.5282,  0.2936],  # CCC
-    [0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  0.0000,  1.0000],  # D
-], dtype=float)
-
-# Map full credit-rating notch → broad S&P category used in the matrix above.
-_NOTCH_TO_CATEGORY: Dict[str, str] = {
-    "AAA":  "AAA",
-    "AA+":  "AA",  "AA":  "AA",  "AA-":  "AA",
-    "A+":   "A",   "A":   "A",   "A-":   "A",
-    "BBB+": "BBB", "BBB": "BBB", "BBB-": "BBB",
-    "BB+":  "BB",  "BB":  "BB",  "BB-":  "BB",
-    "B+":   "B",   "B":   "B",   "B-":   "B",
-    "CCC+": "CCC", "CCC": "CCC", "CCC-": "CCC", "CC": "CCC", "C": "CCC",
-    "D":    "D",
-}
-
-# Within-category notch multiplier applied to the broad-category default
-# probability.  A "+" notch is safer, a "-" notch is riskier.
-# Weights chosen so the geometric mean across {+, plain, -} ≈ 1.0.
-_NOTCH_PD_MULT: Dict[str, float] = {
-    "AAA":  1.00,
-    "AA+":  0.60,  "AA":  1.00,  "AA-":  1.55,
-    "A+":   0.60,  "A":   1.00,  "A-":   1.55,
-    "BBB+": 0.60,  "BBB": 1.00,  "BBB-": 1.55,
-    "BB+":  0.60,  "BB":  1.00,  "BB-":  1.55,
-    "B+":   0.60,  "B":   1.00,  "B-":   1.55,
-    "CCC+": 0.60,  "CCC": 1.00,  "CCC-": 1.55,  "CC": 2.00,  "C": 3.50,
-    "D":    1.00,
-}
-
-
-@_lru_cache(maxsize=64)
-def _rtm_power(t_int: int) -> _np.ndarray:
-    """Return the 1-year transition matrix raised to integer power *t_int* (cached)."""
-    return _np.linalg.matrix_power(_RTM_1Y, t_int)
-
-
-def pd_from_rating(rating: str, horizon_years: float = 1.0) -> float:
-    """
-    Derive a Basel CRE31-compatible annualised PD from a credit rating and
-    loan-maturity horizon using the S&P annual corporate transition matrix.
-
-    Methodology
-    -----------
-    1. Map the notched rating (e.g. ``"A-"``) to a broad S&P category (``"A"``).
-    2. Compute the T-year transition matrix P(T):
-         - T ≤ 1 yr : linearly interpolate between identity (t=0) and P¹.
-         - T > 1 yr : linearly interpolate between P^⌊T⌋ and P^(⌊T⌋+1).
-    3. Read the cumulative T-year default probability:
-         ``PD_cum = P(T)[rating_row, Default_col]``
-    4. Apply the within-category notch multiplier for intra-category granularity.
-    5. Annualise to a 1-year-equivalent PD via the survival-rate method::
-
-           PD_1yr = 1 − (1 − PD_cum)^(1/T)
-
-       This keeps the value compatible with the Basel CRE31 A-IRB formula,
-       which expects a 1-year horizon PD (CRE31.17).
-
-    Parameters
-    ----------
-    rating : str
-        Notched rating string, e.g. ``"AA-"``, ``"BBB+"``, ``"B"``.
-    horizon_years : float
-        Loan maturity horizon in years (default 1.0).
-        Clipped to [0.25, 10.0] before computation.
-
-    Returns
-    -------
-    float
-        1-year-equivalent PD in decimal form (e.g. ≈ 0.00061 for ``"A"``).
-        Clamped to [0.0003, 0.999] per Basel CRE31.17 floor (3 bp minimum).
-    """
-    T    = max(0.25, min(float(horizon_years), 10.0))
-    cat  = _NOTCH_TO_CATEGORY.get(rating.upper().strip(), "BBB")   # fallback: BBB
-    mult = _NOTCH_PD_MULT.get(rating.upper().strip(), 1.00)
-    row  = _RTM_CAT_IDX[cat]
-    col  = _RTM_CAT_IDX["D"]
-
-    # Build P(T) via matrix-power + linear interpolation
-    if T <= 1.0:
-        # Interpolate between identity matrix (no transitions) and 1-year matrix
-        P_T = (1.0 - T) * _np.eye(8) + T * _RTM_1Y
-    else:
-        t_lo = int(T)
-        frac = T - t_lo
-        P_T  = (1.0 - frac) * _rtm_power(t_lo) + frac * _rtm_power(t_lo + 1)
-
-    pd_cum    = float(P_T[row, col])
-    pd_annual = 1.0 - (1.0 - pd_cum) ** (1.0 / T)
-
-    # Apply notch multiplier; clamp to Basel CRE31.17 floor / cap
-    return max(0.0003, min(pd_annual * mult, 0.999))
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Portfolio ID Generator  (req #11 — meaningful sequence, day-on-day persistent)
@@ -558,7 +445,13 @@ def create_banking_book_portfolio(
         # PD derived from the S&P rating transition matrix at the exposure's
         # maturity horizon, then stressed by the current macro regime.
         base_pd  = pd_from_rating(counterparty["rating"], horizon_years=maturity)
-        pd       = min(base_pd * lt["pd_mult"] * rng.uniform(0.5, 2.0) * _pd_macro_mult, 0.30)
+        # Apply instrument-type multiplier, idiosyncratic variation, and macro stress,
+        # then clamp to [CRE31.17 floor (3bp), 30%] so the final PD is always
+        # Basel-compliant regardless of how pd_mult or macro stress scale it.
+        from backend.data_sources.credit_calibration import PD_FLOOR as _PD_FLOOR
+        pd       = max(_PD_FLOOR,
+                       min(base_pd * lt["pd_mult"] * rng.uniform(0.5, 2.0) * _pd_macro_mult,
+                           0.30))
         lgd       = lt["lgd"] * rng.uniform(0.85, 1.15)
         lgd       = max(min(lgd, 0.75), 0.10)
         provisions= ead * pd * lgd * rng.uniform(0.5, 1.0)

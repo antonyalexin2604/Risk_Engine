@@ -204,12 +204,16 @@ SF: Dict[str, float] = {
     "CR_B":                 0.0160,
     "CR_CCC":               0.0600,
     # Credit — non-tranched index CDS (CRE52 Table 2)
-    "CR_IDX_IG":            0.0038,   # IG index (CDX IG, iTraxx Main)
-    "CR_IDX_SG":            0.0106,   # SG index (CDX HY, iTraxx Xover)
-    # Legacy aliases kept for backward compatibility
-    "CR_IG":                0.0054,   # ≈ BBB (was 0.0050 — now closest grade)
-    "CR_SG":                0.0106,   # ≈ BB
-    "CR_IDX":               0.0038,
+    "CR_IDX_IG":            0.0050,   # CRE52 Table 2: IG index = 0.50%
+    "CR_IDX_SG":            0.0500,   # CRE52 Table 2: SG index = 5.00%
+    # Legacy IG/SG aliases — aligned to CRE52 Table 2 broad IG/SG split.
+    # CRE52 Table 2 prescribes two supervisory factors for the simplified
+    # IG vs SG treatment: IG = 0.50%, SG = 5.00%.  These are the values
+    # used when counterparty credit quality is only known at the broad
+    # investment-grade / sub-investment-grade level (no notched rating).
+    "CR_IG":                0.0050,   # CRE52 Table 2: IG single-name = 0.50%
+    "CR_SG":                0.0500,   # CRE52 Table 2: SG single-name = 5.00%
+    "CR_IDX":               0.0038,   # AAA/AA index (legacy, prefer CR_IDX_IG)
     # Credit — tranched CDS per CRE52.41 (use SG scale conservatively)
     "CR_TRANCHED_IG":       0.0054,
     "CR_TRANCHED_SG":       0.0106,
@@ -736,8 +740,10 @@ def compute_addon_credit(trades: List[Trade], has_csa: bool, mpor_days: int) -> 
         shs = _resolve_sub_hedging_set(t)
 
         # GAP-02: 7-grade rating-based SF
-        rating = getattr(t, "credit_rating", "").upper() or \
-                 getattr(t, "credit_quality", "BBB").upper()
+        # credit_quality "IG"/"SG" takes precedence over the defaulted credit_rating="BBB"
+        cq_     = getattr(t, "credit_quality", "IG").upper()
+        cr_     = getattr(t, "credit_rating",  "BBB").upper()
+        rating  = cq_ if cq_ in ("IG", "SG") else cr_
         if shs == "TRANCHED":
             sf_key = "CR_TRANCHED_IG" if rating in ("AAA","AA","A","BBB","IG") else "CR_TRANCHED_SG"
         elif shs in ("INDEX_CDS", "NON_TRANCHED"):
@@ -1052,10 +1058,16 @@ class SACCREngine:
                 sd = 1.0
 
             # SF for this trade (GAP-02: rating-granular credit SF)
+            # RATING_SF_MAP: notched rating / broad quality → SF dict key.
+            # Notched ratings (AAA-CCC) use the granular per-grade SF.
+            # Broad labels "IG" and "SG" use the CRE52 Table 2 IG/SG aggregate
+            # supervisory factors (0.50% and 5.00%) — matched to CR_IG / CR_SG.
             RATING_SF_MAP: Dict[str, str] = {
                 "AAA": "CR_AAA", "AA": "CR_AA", "A": "CR_A",
                 "BBB": "CR_BBB", "BB": "CR_BB", "B": "CR_B", "CCC": "CR_CCC",
-                "NR":  "CR_BBB",  "IG": "CR_BBB",  "SG": "CR_BB",
+                "NR":  "CR_BBB",   # unrated → BBB conservative proxy
+                "IG":  "CR_IG",    # CRE52 Table 2: IG aggregate = 0.50%
+                "SG":  "CR_SG",    # CRE52 Table 2: SG aggregate = 5.00%
             }
             if ac == "IR":
                 sf_val = SF["IR"] * (5.0 if t.is_volatility else 0.5 if t.is_basis else 1.0)
@@ -1068,8 +1080,14 @@ class SACCREngine:
                 eq_key = "EQ_INDEX" if any(k in uid for k in _KW) else "EQ"
                 sf_val = SF[eq_key] * (5.0 if t.is_volatility else 0.5 if t.is_basis else 1.0)
             elif ac == "CR":
-                rating = getattr(t, "credit_rating", "").upper() or \
-                         getattr(t, "credit_quality", "BBB").upper()
+                # Priority: credit_quality "IG"/"SG" (CRE52 broad labels) takes
+                # precedence over credit_rating when the broad label is present.
+                # credit_rating defaults to "BBB" which would otherwise shadow
+                # an explicitly set credit_quality="SG".
+                cq = getattr(t, "credit_quality", "IG").upper()
+                cr = getattr(t, "credit_rating",  "BBB").upper()
+                # Use broad IG/SG label when explicitly set; else use granular rating
+                rating = cq if cq in ("IG", "SG") else cr
                 if shs == "TRANCHED":
                     sf_val = SF["CR_TRANCHED_IG"] if rating in ("AAA","AA","A","BBB","IG") else SF["CR_TRANCHED_SG"]
                 elif shs in ("INDEX_CDS", "NON_TRANCHED"):
