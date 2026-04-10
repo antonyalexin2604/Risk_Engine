@@ -37,6 +37,10 @@ from dataclasses import dataclass, field
 from backend.engines.sa_ccr import Trade, NettingSet
 from backend.engines.a_irb import BankingBookExposure
 from backend.data_sources.credit_calibration import pd_from_rating  # RTM-based PD
+from backend.data_sources.lgd_calibration import (               # Frye-Jacobs LGD
+    DEFAULT_LGD_MODEL as _LGD_MODEL,
+    LGD_FLOOR_UNSECURED as _LGD_FLOOR_UNSECURED,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scale Configuration  ← edit these to expand the portfolio universe
@@ -452,9 +456,8 @@ def create_banking_book_portfolio(
         pd       = max(_PD_FLOOR,
                        min(base_pd * lt["pd_mult"] * rng.uniform(0.5, 2.0) * _pd_macro_mult,
                            0.30))
-        lgd       = lt["lgd"] * rng.uniform(0.85, 1.15)
-        lgd       = max(min(lgd, 0.75), 0.10)
-        provisions= ead * pd * lgd * rng.uniform(0.5, 1.0)
+
+        provisions= ead * pd * 0.45 * rng.uniform(0.5, 1.0)  # provision estimate; lgd set below
 
         # ── Mitigant assignment — diversified across four CRM channels ──────────
         # Each exposure independently rolls for each mitigant type.
@@ -484,6 +487,15 @@ def create_banking_book_portfolio(
             else:
                 col_type  = "FINANCIAL"
                 col_value = ead * rng.uniform(0.30, 0.80)
+
+        # ── LGD from Frye-Jacobs TTC table (lgd_calibration.py) ─────────────
+        # Now that col_type is known, derive LGD from the model table.
+        # ±10% idiosyncratic band reflects facility-level variation within class.
+        _lgd_col = col_type if col_type != "NONE" else "NONE"
+        _lgd_ttc, _ = _LGD_MODEL.ttc_lgd(lt["asset"], _lgd_col)
+        lgd = _lgd_ttc * rng.uniform(0.90, 1.10)
+        lgd = max(min(lgd, 0.95), _LGD_FLOOR_UNSECURED)
+        provisions = ead * pd * lgd * rng.uniform(0.5, 1.0)  # recalc with actual LGD
 
         # (C) Guarantee from a better-rated entity (banks, sovereigns only)
         has_guarantee    = False
@@ -524,6 +536,7 @@ def create_banking_book_portfolio(
             guarantee_coverage= gua_coverage,
             deposit_offset    = deposit_offset,
             provisions        = provisions,
+            lgd_model         = _LGD_MODEL,     # Frye-Jacobs downturn (CRE36.83)
         )
         exposures.append(exp)
 

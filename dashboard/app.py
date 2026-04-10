@@ -776,7 +776,76 @@ elif page == "Banking Book":
     tdf.rename(columns={k:v for k,v in rename.items() if k in tdf.columns}, inplace=True)
     st.dataframe(tdf, width="stretch", hide_index=True)
 
+    # ── LGD Model Breakdown (Frye-Jacobs three layers) ─────────────────────
+    sec("LGD MODEL BREAKDOWN — THREE-LAYER FRYE-JACOBS ANALYSIS")
+    try:
+        from backend.data_sources.lgd_calibration import (
+            DEFAULT_LGD_MODEL, _TTC_TABLE, LGD_FLOORS_SECURED
+        )
+        class _MD:
+            def __init__(self, si): self._si = si
+            def stress_index(self): return self._si
+        si_live = cap.get("macro_stress_index", 0.30)
+        lgd_rows = []
+        for (ac, col), (ttc, rho) in sorted(_TTC_TABLE.items()):
+            dt   = DEFAULT_LGD_MODEL.downturn_lgd(ac, col)
+            cond = DEFAULT_LGD_MODEL.conditional_lgd(ac, _MD(si_live), col)
+            fl   = LGD_FLOORS_SECURED.get(col, 0.25)
+            lgd_rows.append({
+                "Asset Class":       ac,
+                "Collateral":        col,
+                "rho_LGD":           f"{rho:.2f}",
+                "TTC LGD":           f"{ttc*100:.1f}%",
+                "Downturn LGD (P1)": f"{dt*100:.1f}%",
+                "Conditional (P2)":  f"{cond*100:.1f}%",
+                "CRE32.16 Floor":    f"{fl*100:.0f}%",
+                "Floor Binding":     "YES" if dt <= fl + 0.001 else "—",
+            })
+        col_l, col_r = st.columns([3, 2])
+        with col_l:
+            st.markdown("**Reference LGD Table** — TTC from Moody's / S&P recovery data, stressed via Frye-Jacobs")
+            lgd_df = pd.DataFrame(lgd_rows)
+            st.dataframe(lgd_df, width="stretch", hide_index=True)
+        with col_r:
+            st.markdown("**Frye-Jacobs Downturn Formula (CRE36.83)**")
+            st.code(
+                "LGD_DT = Phi((Phi_inv(LGD_TTC) + rho_LGD x Phi_inv(0.999))"
+                " / sqrt(1 - rho_LGD^2))",
+                language=None,
+            )
+            st.markdown(
+                "- **TTC LGD**: long-run default-weighted average (Moody's 2023)\n"
+                "- **Downturn LGD (P1)**: 99.9th percentile — Pillar 1 capital\n"
+                "- **Conditional (P2)**: macro stress-index conditioned — ICAAP\n"
+                "- **rho_LGD**: LGD-systematic correlation (Frye 2000)\n"
+                "- **Floor**: CRE32.16 regulatory backstop"
+            )
+            rhos = [0.10, 0.20, 0.30, 0.40, 0.50]
+            dts  = [
+                DEFAULT_LGD_MODEL._frye_jacobs_q(0.424, r, DEFAULT_LGD_MODEL._q) * 100
+                for r in rhos
+            ]
+            fig_rho = go.Figure(
+                go.Scatter(
+                    x=rhos, y=dts, mode="lines+markers",
+                    line=dict(color="#2980b9", width=2),
+                    hovertemplate="rho=%{x:.2f}  DT-LGD=%{y:.1f}%<extra></extra>",
+                )
+            )
+            fig_rho.update_layout(
+                **PLOT(250, 0),
+                xaxis_title="rho_LGD",
+                yaxis_title="DT-LGD (%)",
+                title=dict(text="Sensitivity to rho_LGD (CORP, TTC=42.4%)", font=dict(size=11)),
+            )
+            st.plotly_chart(fig_rho, use_container_width=True)
+    except ImportError:
+        st.warning("lgd_calibration.py not found — deploy to backend/data_sources/ to enable.")
+    except Exception as _lgd_err:
+        st.error(f"LGD model panel error: {_lgd_err}")
+
     sec("ALL PORTFOLIOS — CRM OVERVIEW")
+
     bbk_rows = []
     for p in bbk:
         rp  = p.get("total_rwa_pre_mit", p["total_rwa"])

@@ -1,0 +1,129 @@
+{
+  "last_updated": "2026-04-10",
+  "calibrations": [
+    {
+      "sector": "Financials",
+      "credit_quality": "IG",
+      "region": "US",
+      "calibrated_spread_bps": 110.0,
+      "calibration_date": "2026-03-26",
+      "peer_names": [
+        "JPM 5Y CDS",
+        "BAC 5Y CDS",
+        "C 5Y CDS",
+        "WFC 5Y CDS"
+      ],
+      "peer_spreads": [
+        95.0,
+        105.0,
+        120.0,
+        118.0
+      ],
+      "review_status": "APPROVED",
+      "reviewer": "credit.desk@prometheus.risk",
+      "next_review_date": "2026-04-25",
+      "notes": "Calibrated from Big 4 US bank CDS spreads"
+    },
+    {
+      "sector": "Financials",
+      "credit_quality": "HY",
+      "region": "US",
+      "calibrated_spread_bps": 420.0,
+      "calibration_date": "2026-03-31",
+      "peer_names": [
+        "Regional Bank A",
+        "Regional Bank B"
+      ],
+      "peer_spreads": [
+        410.0,
+        430.0
+      ],
+      "review_status": "APPROVED",
+      "reviewer": "credit.desk@prometheus.risk",
+      "next_review_date": "2026-04-30",
+      "notes": ""
+    },
+    {
+      "sector": "Energy",
+      "credit_quality": "IG",
+      "region": "US",
+      "calibrated_spread_bps": 130.0,
+      "calibration_date": "2026-03-21",
+      "peer_names": [
+        "XOM 5Y CDS",
+        "CVX 5Y CDS",
+        "COP 5Y CDS"
+      ],
+      "peer_spreads": [
+        115.0,
+        125.0,
+        145.0
+      ],
+      "review_status": "APPROVED",
+      "reviewer": "credit.desk@prometheus.risk",
+      "next_review_date": "2026-04-20",
+      "notes": ""
+    },
+    {
+      "sector": "Energy",
+      "credit_quality": "HY",
+      "region": "US",
+      "calibrated_spread_bps": 480.0,
+      "calibration_date": "2026-03-29",
+      "peer_names": [
+        "OXY 5Y CDS",
+        "APA 5Y CDS"
+      ],
+      "peer_spreads": [
+        465.0,
+        495.0
+      ],
+      "review_status": "APPROVED",
+      "reviewer": "credit.desk@prometheus.risk",
+      "next_review_date": "2026-04-28",
+      "notes": ""
+    },
+    {
+      "sector": "Technology",
+      "credit_quality": "IG",
+      "region": "US",
+      "calibrated_spread_bps": 100.0,
+      "calibration_date": "2026-04-02",
+      "peer_names": [
+        "AAPL 5Y CDS",
+        "MSFT 5Y CDS",
+        "ORCL 5Y CDS"
+      ],
+      "peer_spreads": [
+        85.0,
+        90.0,
+        115.0
+      ],
+      "review_status": "APPROVED",
+      "reviewer": "credit.desk@prometheus.risk",
+      "next_review_date": "2026-05-02",
+      "notes": ""
+    },
+    {
+      "sector": "Financials",
+      "credit_quality": "IG",
+      "region": "EUR",
+      "calibrated_spread_bps": 120.0,
+      "calibration_date": "2026-03-23",
+      "peer_names": [
+        "DBK 5Y CDS",
+        "BNP 5Y CDS",
+        "SAN 5Y CDS"
+      ],
+      "peer_spreads": [
+        135.0,
+        105.0,
+        120.0
+      ],
+      "review_status": "APPROVED",
+      "reviewer": "credit.desk@prometheus.risk",
+      "next_review_date": "2026-04-22",
+      "notes": ""
+    }
+  ]
+}

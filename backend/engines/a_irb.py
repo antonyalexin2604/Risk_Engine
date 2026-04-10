@@ -88,6 +88,9 @@ from datetime import date
 from enum import Enum
 
 from backend.config import AIRB
+# lgd_calibration is imported lazily inside _get_lgd_model() below
+# to avoid circular import: a_irb → data_sources.__init__ → cds_spread_service → a_irb.
+# All callers use _DEFAULT_LGD_MODEL() / _LGD_MODEL_CLS() accessor functions.
 
 # ── Real-time data feed dependencies (all stdlib; yfinance optional) ──────────
 import json          as _json
@@ -888,6 +891,19 @@ class PDTermStructure:
         # Allow non-monotonic (inverted curves in stress)
         return True
 
+
+# ─── Lazy LGD model accessors (avoids circular import at module level) ────────
+_lgd_cal_cache = {}
+
+def _get_default_lgd_model():
+    """Return DEFAULT_LGD_MODEL from lgd_calibration (lazy load)."""
+    if 'default' not in _lgd_cal_cache:
+        import importlib
+        mod = importlib.import_module('backend.data_sources.lgd_calibration')
+        _lgd_cal_cache['default'] = mod.DEFAULT_LGD_MODEL
+    return _lgd_cal_cache['default']
+
+
 @dataclass
 class BankingBookExposure:
     trade_id:           str
@@ -944,6 +960,18 @@ class BankingBookExposure:
     # Best-estimate LGD used in the defaulted-exposure K formula.
     # If None, lgd is used as the best estimate.
     lgd_best_estimate:  Optional[float] = None
+
+    # ── LGD model (CRE36.83 — downturn / Frye-Jacobs) ───────────────────────
+    # When set, compute() uses LGDModel.downturn_lgd() for Pillar 1 capital
+    # and compute_with_macro_overlay() uses LGDModel.conditional_lgd() for
+    # Pillar 2 / ICAAP.  When None the static exp.lgd field is used (legacy).
+    lgd_model:          Optional[object] = None  # type: LGDModel
+
+    # ── Wrong-way LGD flag (CRE36.84) ───────────────────────────────────────
+    # Set True when obligor and collateral are in the same sector and
+    # the collateral is likely to depreciate exactly at default.
+    # LGDModel.wrong_way_lgd() applies a 1.10–1.25× conservative uplift.
+    has_wrong_way_lgd:  bool  = False
 
     # ── IFRS 9 provision staging (CRE35.3) ───────────────────────────────────
     # Under CRE35.3, only Stage 3 specific provisions offset EL for Pillar 1.
@@ -1793,7 +1821,32 @@ class AIRBEngine:
         # Get PD at maturity (term structure)
         pd_base = exp.get_pd_at_maturity()
         pd_eff  = max(pd_base, AIRB.pd_floor)
-        lgd_eff = exp.lgd
+        # ── LGD resolution (CRE36.83) ─────────────────────────────────────────
+        # Priority:
+        #   lgd_model is a model obj → Frye-Jacobs downturn LGD (Pillar 1)
+        #   lgd_model is explicitly None → static exp.lgd (legacy / F-IRB fallback)
+        #   lgd_model field not set (dataclass default) → DEFAULT_LGD_MODEL
+        # CRE36.84 wrong-way uplift applied on top of either path.
+        col_t_for_lgd = getattr(exp, 'collateral_type', 'NONE')
+        _lgd_model_attr = exp.__dict__.get('lgd_model', 'UNSET')  # distinguish None vs unset
+        if _lgd_model_attr is None:
+            # Explicitly set to None → use static exp.lgd (legacy / unit-test mode)
+            lgd_eff     = exp.lgd
+            _lgd_be_est = exp.lgd_best_estimate
+        else:
+            _lgd_model = (_lgd_model_attr if _lgd_model_attr != 'UNSET'
+                          else None) or _get_default_lgd_model()
+            lgd_eff = _lgd_model.downturn_lgd(exp.asset_class, col_t_for_lgd, pd_eff)
+            # CRE36.84: wrong-way LGD uplift when obligor/collateral correlated
+            if getattr(exp, 'has_wrong_way_lgd', False):
+                lgd_eff = _lgd_model.wrong_way_lgd(
+                    lgd_eff, col_t_for_lgd, exp.asset_class, exp.asset_class
+                )
+            # CRE36.86 best-estimate LGD
+            if exp.lgd_best_estimate is None and hasattr(_lgd_model, 'best_estimate_lgd'):
+                _lgd_be_est = _lgd_model.best_estimate_lgd(exp.asset_class, col_t_for_lgd)
+            else:
+                _lgd_be_est = exp.lgd_best_estimate
         M_eff   = exp.maturity
 
         # CRE31.8 — daily-margined derivative: cap effective maturity at 1 year
@@ -1923,11 +1976,9 @@ class AIRBEngine:
         # Previously el_be was set equal to lgd_be making K always zero — wrong.
         is_defaulted = pd_eff >= 1.0
         if is_defaulted:
-            lgd_be = exp.lgd_best_estimate if exp.lgd_best_estimate is not None else lgd_eff
+            # CRE36.86: use structured best-estimate from LGDModel when available
+            lgd_be = _lgd_be_est if _lgd_be_est is not None else lgd_eff
             lgd_be = min(max(lgd_be, 0.0), 1.0)
-            # Best-estimate EL: if no separate field, use 50% of LGD as a
-            # conservative placeholder (expected recovery ~50% of downturn LGD).
-            # Banks should supply lgd_best_estimate explicitly per CRE36.86.
             el_be = lgd_be * 0.5
             K = max(lgd_be - el_be, 0.0)
             warnings.append(
@@ -2097,7 +2148,19 @@ class AIRBEngine:
 
         # Overlay 1: Macro adjustment (separate PD / LGD stress dicts)
         pd_macro  = self.macro_overlay.adjust_pd_for_macro(pd_base, macro)
-        lgd_macro = self.macro_overlay.adjust_lgd_for_macro(lgd_base, macro)
+        # ── LGD overlay — Pillar 2 conditional (Frye-Jacobs at macro stress_index) ─
+        # Replaces the heuristic spread-elasticity approximation in
+        # MacroeconomicOverlay.adjust_lgd_for_macro() with a model grounded
+        # in the Frye-Jacobs bivariate normal copula (CRE36.83 / Pillar 2).
+        _lgd_model_overlay = getattr(exp_copy, 'lgd_model', None) or _get_default_lgd_model()
+        _col_t_overlay     = getattr(exp_copy, 'collateral_type', 'NONE')
+        lgd_macro = _lgd_model_overlay.conditional_lgd(
+            exp_copy.asset_class, macro, _col_t_overlay
+        )
+        if getattr(exp_copy, 'has_wrong_way_lgd', False):
+            lgd_macro = _lgd_model_overlay.wrong_way_lgd(
+                lgd_macro, _col_t_overlay, exp_copy.asset_class, exp_copy.asset_class
+            )
 
         # Overlay 2: Market-implied PD calibration (CDS term structure)
         pd_market_implied = None
