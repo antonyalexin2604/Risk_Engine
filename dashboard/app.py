@@ -328,7 +328,7 @@ with st.sidebar:
     page = st.radio("", [
         "Capital Dashboard", "Derivative Portfolios", "Banking Book",
         "Market Risk (FRTB)", "IMM Exposure Profiles",
-        "CVA Risk", "CCP Exposure",
+        "CVA Risk", "CCP Exposure", "Operational Risk",
         "Risk Limits", "Backtesting", "Reports",
         "Market Calibration",
     ], label_visibility="collapsed")
@@ -1288,6 +1288,181 @@ Clearing member acting as intermediary → 2% on client EAD · Exposure treated 
 </div>
 """, unsafe_allow_html=True)
 
+# ══════════════════════════════════════════════════════════════════════════════
+# OPERATIONAL RISK — OPE25 SMA
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "Operational Risk":
+    st.markdown('<div class="page-title">Operational Risk</div>', unsafe_allow_html=True)
+    st.markdown('<div class="page-sub">Basel III SMA (OPE25) · BIC × ILM</div>',
+                unsafe_allow_html=True)
+
+    try:
+        from backend.engines.operational_risk import (
+            BusinessIndicatorInput, compute_sma_capital,
+            analyze_losses_by_event_type, analyze_losses_by_business_line,
+            get_loss_timeline
+        )
+        from backend.data_sources.loss_event_database import get_loss_event_database
+        
+        # Load business indicator data
+        bi_inputs = [
+            BusinessIndicatorInput(
+                year=2023, interest_income=800, interest_expense=400,
+                dividend_income=80, services_income=500, services_expense=150,
+                financial_income=250, financial_expense=100,
+                other_operating_income=150, trading_book_pnl=300, banking_book_pnl=250,
+            ),
+            BusinessIndicatorInput(
+                year=2024, interest_income=850, interest_expense=425,
+                dividend_income=85, services_income=525, services_expense=160,
+                financial_income=265, financial_expense=105,
+                other_operating_income=160, trading_book_pnl=320, banking_book_pnl=265,
+            ),
+            BusinessIndicatorInput(
+                year=2025, interest_income=900, interest_expense=450,
+                dividend_income=90, services_income=550, services_expense=170,
+                financial_income=280, financial_expense=110,
+                other_operating_income=170, trading_book_pnl=340, banking_book_pnl=280,
+            ),
+        ]
+        
+        # Load loss events
+        db = get_loss_event_database()
+        loss_events = db.get_all_events()
+        
+        if not loss_events:
+            st.warning(
+                "⚠️ **No operational loss events in database.** "
+                "Generate sample data or upload historical loss events to see SMA calculation."
+            )
+            st.info("To generate sample data, run: `python backend/data_generators/03_operational_loss_generator.py`")
+        else:
+            # Compute SMA Capital
+            sma_result = compute_sma_capital(bi_inputs, loss_events)
+            
+            # Display key metrics
+            c1,c2,c3,c4 = st.columns(4)
+            kpi(c1, "Business Indicator", fmt_bn(sma_result.business_indicator * 1e6),
+                "3-year average BI", "OPE25.15", "t-blue")
+            kpi(c2, "BIC", fmt_bn(sma_result.bic * 1e6),
+                "Business Indicator Component", "OPE25.20", "t-blue")
+            kpi(c3, "ILM", f"{sma_result.ilm:.3f}",
+                "Internal Loss Multiplier", "Capped at 1.0", "t-ok" if sma_result.ilm < 1 else "t-warn")
+            kpi(c4, "Op Risk Capital", fmt_bn(sma_result.operational_risk_capital * 1e6),
+                "BIC × ILM", "OPE25", "t-blue")
+            
+            st.markdown("")
+            r1,r2,r3 = st.columns(3)
+            kpi(r1, "Op Risk RWA", fmt_bn(sma_result.rwa_operational * 1e6),
+                "Capital × 12.5", "RBC20.9", "t-blue")
+            kpi(r2, "Loss Component", fmt_bn(sma_result.loss_component * 1e6),
+                "15 × Avg Annual Losses", "OPE25.12", "t-stone")
+            kpi(r3, "Loss Years", f"{sma_result.years_of_loss_data}",
+                "Years of loss data", "10 req for LC" if sma_result.years_of_loss_data < 10 else "✓ Sufficient", 
+                "t-warn" if sma_result.years_of_loss_data < 10 else "t-ok")
+            
+            # BIC Tier Breakdown
+            sec("BUSINESS INDICATOR COMPONENT (BIC) — TIERED APPROACH")
+            bi_bn = sma_result.business_indicator / 1000
+            tier_data = []
+            tiers = [
+                ("Tier 1", 0, 1, 0.12),
+                ("Tier 2", 1, 3, 0.15),
+                ("Tier 3", 3, 10, 0.18),
+                ("Tier 4", 10, 30, 0.21),
+                ("Tier 5", 30, float('inf'), 0.23),
+            ]
+            
+            for tier_name, lower, upper, coef in tiers:
+                if bi_bn > lower:
+                    marginal_bi = min(bi_bn, upper) - lower
+                    marginal_bic = marginal_bi * coef
+                    tier_data.append({
+                        "Tier": tier_name,
+                        "Range (EUR bn)": f"{lower}-{upper if upper != float('inf') else '∞'}",
+                        "Coefficient": f"{coef:.0%}",
+                        "Marginal BI (bn)": f"{marginal_bi:.2f}",
+                        "Marginal BIC (M)": f"{marginal_bic * 1000:.1f}",
+                    })
+            
+            tier_df = pd.DataFrame(tier_data)
+            st.dataframe(tier_df, width="stretch", hide_index=True)
+            
+            # Loss Analysis
+            sec("LOSS ANALYSIS — BY EVENT TYPE & BUSINESS LINE")
+            lcol, rcol = st.columns(2)
+            
+            with lcol:
+                event_type_df = analyze_losses_by_event_type(loss_events)
+                if not event_type_df.empty:
+                    fig_et = go.Figure(go.Bar(
+                        x=event_type_df["event_type"],
+                        y=event_type_df["total_net_loss"],
+                        marker_color=C["red"],
+                        opacity=0.85,
+                        text=[f"{v:.1f}M" for v in event_type_df["total_net_loss"]],
+                        textposition="outside",
+                        textfont=dict(family="JetBrains Mono", size=9),
+                    ))
+                    fig_et.update_layout(**PLOT(280,10), 
+                        xaxis_title="Event Type", yaxis_title="Net Loss (EUR M)",
+                        showlegend=False)
+                    st.plotly_chart(fig_et)
+            
+            with rcol:
+                bl_df = analyze_losses_by_business_line(loss_events)
+                if not bl_df.empty:
+                    fig_bl = go.Figure(go.Pie(
+                        labels=bl_df["business_line"],
+                        values=bl_df["total_net_loss"],
+                        hole=0.5,
+                        marker=dict(colors=[C["red"], C["amber"], C["gold"], C["teal"], C["blue"]]),
+                        textinfo="percent+label",
+                        textfont=dict(family="JetBrains Mono", size=9),
+                    ))
+                    fig_bl.update_layout(**PLOT(280,10), showlegend=True, legend=LEG("v",0.5,1.02))
+                    st.plotly_chart(fig_bl)
+            
+            # Timeline
+            timeline_df = get_loss_timeline(loss_events)
+            if not timeline_df.empty:
+                sec("LOSS TIMELINE — ANNUAL AGGREGATION")
+                annual_losses = timeline_df.groupby(timeline_df["date"].dt.year)["net_loss"].sum().reset_index()
+                annual_losses.columns = ["Year", "Net Loss"]
+                
+                fig_ann = go.Figure(go.Bar(
+                    x=annual_losses["Year"],
+                    y=annual_losses["Net Loss"],
+                    marker_color=C["red"],
+                    opacity=0.85,
+                    text=[f"{v:.1f}M" for v in annual_losses["Net Loss"]],
+                    textposition="outside",
+                    textfont=dict(family="JetBrains Mono", size=10),
+                ))
+                fig_ann.update_layout(**PLOT(300,10), 
+                    xaxis_title="Year", yaxis_title="Net Loss (EUR M)")
+                st.plotly_chart(fig_ann)
+        
+        sec("REGULATORY CONTEXT — OPE25")
+        st.markdown("""
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;font-family:'Nunito Sans',sans-serif;font-size:0.83rem;color:var(--slate-600)">
+<div style="background:var(--white);border:1px solid var(--border);border-radius:10px;padding:14px 16px">
+<strong style="color:var(--slate-800)">Business Indicator Component (BIC)</strong><br>
+Five-tier marginal structure · BI = 3-year average of annual business indicators · Tier 1: 0-1bn EUR @ 12% · Tier 5: >30bn EUR @ 23%
+</div>
+<div style="background:var(--white);border:1px solid var(--border);border-radius:10px;padding:14px 16px">
+<strong style="color:var(--slate-800)">Internal Loss Multiplier (ILM)</strong><br>
+ILM = min(1, ln(exp(1)-1+(LC/BIC)^0.8)) · LC = 15 × average annual losses · Requires 10+ years of loss data · Defaults to 1.0 if insufficient data
+</div>
+</div>
+""", unsafe_allow_html=True)
+        
+    except ImportError as e:
+        st.error(f"Operational Risk module not available: {e}")
+        st.info("Ensure operational_risk.py and loss_event_database.py are deployed to backend/")
+    except Exception as e:
+        st.error(f"Error loading Operational Risk data: {e}")
+        st.info("Check that loss event data is available and properly formatted.")
 
 elif page == "Reports":
     st.markdown('<div class="page-title">Reports</div>', unsafe_allow_html=True)
