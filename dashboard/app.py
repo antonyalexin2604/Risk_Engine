@@ -15,7 +15,8 @@ import numpy as np
 import plotly.graph_objects as go
 import io
 from datetime import date
-
+from styling import apply_global_styling
+apply_global_styling()
 from backend.main import PrometheusRunner
 from backend.data_sources.persistence import (
     read_capital_history, read_rwa_by_month, read_rwa_by_year,
