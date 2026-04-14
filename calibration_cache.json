@@ -1,0 +1,85 @@
+{
+  "calibration_date": "2026-04-14",
+  "lookback_days": 252,
+  "data_quality": "fallback",
+  "eq_vol_hist": 0.2,
+  "eq_vol_ewma": 0.2,
+  "eq_vol_stressed": 0.4,
+  "eq_drift": 0.05,
+  "eq_spot": 5000.0,
+  "ir_vol_hist": 0.015,
+  "ir_vol_stressed": 0.03,
+  "ir_kappa": 0.1,
+  "ir_theta_10y": 0.045,
+  "ir_theta_short": 0.04,
+  "ir_spot_10y": 0.045,
+  "ir_spot_short": 0.04,
+  "fx_vol_eur": 0.08,
+  "fx_vol_gbp": 0.09,
+  "fx_vol_jpy": 0.1,
+  "fx_vol_chf": 0.08,
+  "fx_spot_eur": 0.9,
+  "fx_spot_gbp": 0.78,
+  "fx_spot_jpy": 130.0,
+  "fx_spot_chf": 0.92,
+  "cs_ig_vol": 0.3,
+  "cs_hy_vol": 0.45,
+  "vix_level": 18.0,
+  "cmdty_energy_vol": 0.3,
+  "cmdty_metals_vol": 0.2,
+  "cmdty_agri_vol": 0.18,
+  "cmdty_energy_spot": 100.0,
+  "cmdty_metals_spot": 100.0,
+  "cmdty_agri_spot": 100.0,
+  "correlation_matrix": [
+    [
+      1.0,
+      0.6,
+      0.2,
+      0.5,
+      0.4,
+      0.7
+    ],
+    [
+      0.6,
+      1.0,
+      0.15,
+      0.3,
+      0.35,
+      0.65
+    ],
+    [
+      0.2,
+      0.15,
+      1.0,
+      0.1,
+      0.05,
+      0.25
+    ],
+    [
+      0.5,
+      0.3,
+      0.1,
+      1.0,
+      0.2,
+      0.6
+    ],
+    [
+      0.4,
+      0.35,
+      0.05,
+      0.2,
+      1.0,
+      0.55
+    ],
+    [
+      0.7,
+      0.65,
+      0.25,
+      0.6,
+      0.55,
+      1.0
+    ]
+  ],
+  "fetch_log": {}
+}

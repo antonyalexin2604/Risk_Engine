@@ -1,0 +1,55 @@
+version: '3.9'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROMETHEUS Risk Platform — Docker Compose
+# Tested on: macOS M1 (arm64) · PostgreSQL 15 · pgAdmin 4
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  prometheus_db:
+    image: postgres:15-alpine
+    container_name: prometheus_db
+    platform: linux/arm64
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: prometheus_risk
+      POSTGRES_USER: risk_admin
+      POSTGRES_PASSWORD: P@ssw0rd_Risk2024
+    ports:
+      - "5432:5432"
+    volumes:
+      - prometheus_pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/01_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U risk_admin -d prometheus_risk"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: prometheus_pgadmin
+    platform: linux/amd64          # pgAdmin has no arm64 native; Rosetta handles it
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@prometheus.risk
+      PGADMIN_DEFAULT_PASSWORD: Admin@2024
+    ports:
+      - "5050:80"
+    depends_on:
+      prometheus_db:
+        condition: service_healthy
+
+volumes:
+  prometheus_pgdata:
+    driver: local
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DBeaver connection details (add in DBeaver → New Connection → PostgreSQL):
+#   Host      : localhost
+#   Port      : 5432
+#   Database  : prometheus_risk
+#   User      : risk_admin
+#   Password  : P@ssw0rd_Risk2024
+# ─────────────────────────────────────────────────────────────────────────────

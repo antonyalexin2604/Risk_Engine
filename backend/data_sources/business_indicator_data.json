@@ -1,0 +1,45 @@
+{
+  "last_updated": "2026-04-10",
+  "note": "Sample Business Indicator data for SMA calculation (EUR millions)",
+  "business_indicators": [
+    {
+      "year": 2023,
+      "interest_income": 800.0,
+      "interest_expense": 400.0,
+      "dividend_income": 80.0,
+      "services_income": 500.0,
+      "services_expense": 150.0,
+      "financial_income": 250.0,
+      "financial_expense": 100.0,
+      "other_operating_income": 150.0,
+      "trading_book_pnl": 300.0,
+      "banking_book_pnl": 250.0
+    },
+    {
+      "year": 2024,
+      "interest_income": 850.0,
+      "interest_expense": 425.0,
+      "dividend_income": 85.0,
+      "services_income": 525.0,
+      "services_expense": 160.0,
+      "financial_income": 265.0,
+      "financial_expense": 105.0,
+      "other_operating_income": 160.0,
+      "trading_book_pnl": 320.0,
+      "banking_book_pnl": 265.0
+    },
+    {
+      "year": 2025,
+      "interest_income": 900.0,
+      "interest_expense": 450.0,
+      "dividend_income": 90.0,
+      "services_income": 550.0,
+      "services_expense": 170.0,
+      "financial_income": 280.0,
+      "financial_expense": 110.0,
+      "other_operating_income": 170.0,
+      "trading_book_pnl": 340.0,
+      "banking_book_pnl": 280.0
+    }
+  ]
+}
