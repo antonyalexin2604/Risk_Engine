@@ -1,15 +1,9 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# PROMETHEUS — Launch the Streamlit dashboard
-# Run from anywhere:  bash /Users/aaron/Documents/Project/Prometheus/run_dashboard.sh
+# PROMETHEUS — Run the full model validation test suite
 # ─────────────────────────────────────────────────────────────────────────────
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
-echo "  Project : $PROJECT_ROOT"
-echo "  Opening : http://localhost:8501"
-echo "  Stop    : Ctrl+C"
+echo "Running 48 model validation tests..."
 echo ""
-python3 -m streamlit run dashboard/app.py \
-  --server.port 8501 \
-  --server.headless false \
-  --browser.gatherUsageStats false
+python3 -m pytest tests/test_engines.py -v --tb=short

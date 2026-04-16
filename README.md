@@ -71,7 +71,7 @@ unzip PROMETHEUS_v1.zip
 
 ```bash
 cd /Users/aaron/Documents/Project/Prometheus
-bash setup.sh
+bash utils/setup.sh
 ```
 
 This single command:
@@ -85,7 +85,7 @@ This single command:
 ### Step 3 — Launch the dashboard
 
 ```bash
-bash /Users/aaron/Documents/Project/Prometheus/run_dashboard.sh
+bash /Users/aaron/Documents/Project/Prometheus/utils/run_dashboard.sh
 ```
 
 Opens at **http://localhost:8501**
@@ -93,13 +93,13 @@ Opens at **http://localhost:8501**
 ### Step 4 — Run the risk engine (CLI)
 
 ```bash
-bash /Users/aaron/Documents/Project/Prometheus/run_engine.sh
+bash /Users/aaron/Documents/Project/Prometheus/utils/run_engine.sh
 ```
 
 ### Step 5 — Run tests
 
 ```bash
-bash /Users/aaron/Documents/Project/Prometheus/run_tests.sh
+bash /Users/aaron/Documents/Project/Prometheus/utils/run_tests.sh
 ```
 
 Expected: **48/48 passed**
@@ -125,10 +125,6 @@ pgAdmin is at **http://localhost:5050**
 ```
 PROMETHEUS/
 │
-├── docker/
-│   ├── docker-compose.yml      PostgreSQL 15 (arm64) + pgAdmin 4
-│   └── init.sql                17 tables · 4 schemas · 8 risk limits
-│
 ├── backend/
 │   ├── config.py               All regulatory parameters
 │   ├── main.py                 Daily risk orchestrator (5-part RWA)
@@ -145,11 +141,35 @@ PROMETHEUS/
 │       ├── portfolio_generator.py   DRV-YYYY-NNN / BBK-YYYY-NNN portfolios
 │       └── cva_generator.py         CVA inputs + CCP cleared positions
 │
+├── BASEL_Guidelines/           BCBS source PDFs (CRE, MAR, RBC, CAP, MGN)
+│
 ├── dashboard/
 │   └── app.py                  Streamlit — 8 pages, xlsx/csv download
 │
+├── docker/
+│   ├── docker-compose.yml      PostgreSQL 15 (arm64) + pgAdmin 4
+│   └── init.sql                17 tables · 4 schemas · 8 risk limits
+│
+├── docs/
+│   ├── PROMETHEUS_COMPREHENSIVE_DOCUMENTATION.docx   Master document
+│   ├── PROMETHEUS_FSD.md                             FSD source markdown
+│   ├── IMM_TECHNICAL_GUIDE.md / .docx                IMM reference
+│   ├── CVA_ENHANCEMENTS_SUMMARY.md                   MAR50 compliance
+│   ├── CVA_IMPLEMENTATION_GUIDE.md                   CVA implementation
+│   └── MARKET_DATA_ARCHITECTURE.md                   Data provider design
+│
 ├── tests/
 │   └── test_engines.py         48 model validation tests (all passing)
+│
+├── utils/
+│   ├── setup.sh                One-shot environment setup
+│   ├── run_dashboard.sh        Launch Streamlit dashboard
+│   ├── run_engine.sh           CLI daily risk run
+│   ├── run_tests.sh            Run full test suite
+│   ├── generate_*.py           Documentation generators (FSD, IMM, FRTB, comprehensive)
+│   ├── backfill_history.py     Populate 90-day historical snapshots
+│   ├── test_cva_enhancements.py  CVA MAR50 compliance test suite
+│   └── calibration_cache.json  Cached calibration data
 │
 ├── requirements.txt
 └── README.md
