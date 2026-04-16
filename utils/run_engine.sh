@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # PROMETHEUS — Run the daily risk engine (CLI)
 # ─────────────────────────────────────────────────────────────────────────────
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 DATE_ARG="${1:-today}"
