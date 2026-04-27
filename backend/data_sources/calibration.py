@@ -530,12 +530,61 @@ class CalibratedParams:
           long_run_rate ← OU theta (long-run 10Y yield)
           correlation_matrix ← EWMA pairwise matrix
         """
-        params.volatility      = max(self.eq_vol_ewma,    0.05)
-        params.stressed_vol    = max(self.eq_vol_stressed, params.volatility * 1.5)
-        params.drift           = max(min(self.eq_drift, 0.30), -0.30)
-        params.ir_vol          = max(self.ir_vol_hist,    0.001)
-        params.ir_stressed_vol = max(self.ir_vol_stressed, params.ir_vol * 1.5)
-        params.mean_reversion  = max(min(self.ir_kappa, 3.0), 0.01)
+        params.volatility = max(self.eq_vol_ewma, 0.05)
+        params.drift      = max(min(self.eq_drift, 0.30), -0.30)
+        params.ir_vol     = max(self.ir_vol_hist, 0.001)
+        params.mean_reversion = max(min(self.ir_kappa, 3.0), 0.01)
+
+        # ── Fix B (CRE53 §stress calibration): GFC floors for stressed vols ─
+        # apply_to_imm must NEVER override the empirically-calibrated GFC floors
+        # set in MarketParams. The calibration window (lookback_days ≈ 1yr) does
+        # not span the 2007-09 GFC and will therefore always underestimate the
+        # true stressed vol. We enforce: stressed ≥ max(calibrated, GFC floor).
+        #
+        # GFC floors (source: academic literature + BCBS QIS data):
+        #   EQ:    0.38 — S&P 500 realised 2007-09 (VIX avg ~32%, realized ~38%)
+        #   IR:    0.020— 10Y UST absolute rate σ in 2007-09 (~120-200bp/yr)
+        #   FX:    0.18 — EURUSD realised 2007-09 (~15-18% annual)
+        #   CR:    0.65 — IG CDX log-vol 2007-09 (spread 70bp→280bp)
+        #   CMDTY: 0.58 — WTI realised 2007-09 (oil $147→$35; ~58% annual)
+        GFC_EQ_FLOOR    = 0.38
+        GFC_IR_FLOOR    = 0.020
+        GFC_FX_FLOOR    = 0.18   # applied to fx_stressed_vol in MarketParams
+        GFC_CR_FLOOR    = 0.65   # applied to cr_stressed_vol
+        GFC_CMDTY_FLOOR = 0.58   # applied to cmdty_stressed_vol
+
+        # EQ stressed vol: max of calibration window, 1.5× base, and GFC floor
+        params.stressed_vol = max(
+            self.eq_vol_stressed,     # worst 21-day rolling vol in lookback
+            params.volatility * 1.5,  # minimum 1.5× base conservatism
+            GFC_EQ_FLOOR,             # Fix B: empirical GFC floor (CRE53)
+        )
+
+        # IR stressed vol: max of calibration, 1.5× base, and GFC floor
+        params.ir_stressed_vol = max(
+            self.ir_vol_stressed,     # worst rolling vol of yield changes
+            params.ir_vol * 1.5,      # minimum 1.5× base conservatism
+            GFC_IR_FLOOR,             # Fix B: empirical GFC floor (CRE53)
+        )
+
+        # FX, CR, CMDTY: these are not overwritten by calibration currently,
+        # but guard them explicitly so future calibration extensions cannot
+        # inadvertently reduce them below the GFC floor.
+        if hasattr(params, 'fx_stressed_vol'):
+            params.fx_stressed_vol = max(
+                getattr(params, 'fx_stressed_vol', 0.0),
+                GFC_FX_FLOOR,
+            )
+        if hasattr(params, 'cr_stressed_vol'):
+            params.cr_stressed_vol = max(
+                getattr(params, 'cr_stressed_vol', 0.0),
+                GFC_CR_FLOOR,
+            )
+        if hasattr(params, 'cmdty_stressed_vol'):
+            params.cmdty_stressed_vol = max(
+                getattr(params, 'cmdty_stressed_vol', 0.0),
+                GFC_CMDTY_FLOOR,
+            )
         if hasattr(params, "long_run_rate"):
             params.long_run_rate = max(self.ir_theta_10y, 0.001)
         params.correlation_matrix = np.array(self.correlation_matrix)
