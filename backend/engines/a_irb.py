@@ -1696,20 +1696,25 @@ class ImpliedPDCalibration:
         return min(max(implied_pd, AIRB.pd_floor), 1.0)
     
     def blended_pd(self, pd_historical: float, pd_market_implied: float,
-                  weights: Tuple[float, float] = (0.60, 0.40)) -> float:
+                  weights: Tuple[float, float] = (0.60, 0.40),
+                  rating: str = "BBB") -> float:
         """
-        Blend historical PD with market-implied PD.
-        Default: 60% historical (stable), 40% market-implied (forward-looking).
-        
-        Higher market weight during stress (prices reflect live information).
+        Fix 7 (CRE36.63): TtC-anchored blended PD for A-IRB regulatory capital.
+        Step 1: internal PiT blend (historical + market-implied).
+        Step 2: 80% TtC LRA anchor + 20% PiT overlay per CRE36.77.
         """
+        from backend.data_sources.credit_calibration import LRA_PD_TTC
+        import re as _re
+        broad = _re.sub(r"[+-]", "", rating.strip().upper())
+        lra   = LRA_PD_TTC.get(broad, LRA_PD_TTC.get("NR", 0.00209))
         if pd_market_implied is None or pd_market_implied <= 0:
-            return pd_historical
-        
-        w_hist, w_market = weights
-        blended = w_hist * pd_historical + w_market * pd_market_implied
-        
-        return min(max(blended, AIRB.pd_floor), 1.0)
+            pit_blended = pd_historical
+        else:
+            w_hist, w_market = weights
+            pit_blended = w_hist * pd_historical + w_market * pd_market_implied
+        # TtC regulatory overlay — 80% LRA, 20% PiT (Fix 7 / CRE36.77)
+        regulatory_pd = 0.80 * lra + 0.20 * pit_blended
+        return min(max(regulatory_pd, AIRB.pd_floor), 1.0)
     
     def calibration_spread(self, pd_historical: float, recovery_rate: float = 0.40) -> float:
         """

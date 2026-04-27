@@ -453,20 +453,28 @@ _SUPERVISORY_SPREAD: Dict[str, float] = {
 def _supervisory_spread(rating: str) -> float:
     return _SUPERVISORY_SPREAD.get(rating[:3].upper(), _SUPERVISORY_SPREAD["NR"])
 
-def _effective_maturity_discount(M: float, spread: float,
-                                 risk_free_rate: float = 0.05) -> float:
+def _effective_maturity_discount(M: float, spread: float = 0.0,
+                                 risk_free_rate: float = 0.05,
+                                 imm_bank: bool = True) -> float:
     """
-    MAR50.25: DF_i = (1 - exp(-r × M_i)) / (r × M_i)
-    Uses current OIS/SOFR rate instead of the hardcoded 5% proxy.
-    Pass risk_free_rate from CVAMarketConditions.risk_free_rate in production.
+    Fix 3 (MAR50.15(4)): Supervisory discount factor DFNS.
+
+    IMM banks  (imm_bank=True):  DFNS = 1.0
+      The IMM effective maturity already incorporates discounting.
+    Non-IMM banks (imm_bank=False):
+      DFNS = (1 − exp(−0.05 × M)) / (0.05 × M)
+      Basel hardcodes r = 5% — do NOT substitute live OIS rate here
+      (MAR50 footnote 3 is explicit on the 5% proxy).
     """
+    if imm_bank:
+        return 1.0          # MAR50.15(4)(i)
     if M <= 0:
         return 1.0
-    r = max(risk_free_rate, 1e-6)   # guard against zero rates
-    return (1 - math.exp(-r * M)) / (r * M)
+    r = 0.05                # Basel-fixed rate — NOT market OIS (MAR50 fn. 3)
+    return (1.0 - math.exp(-r * M)) / (r * M)
 
 def _scva_c(inp: "CVAInput", rating_map: Optional[Dict[str, str]],
-             rfr: float) -> float:
+             rfr: float, imm_bank: bool = True) -> float:
     """
     MAR50.15: Stand-alone CVA capital component for counterparty c.
     SC_c = RW_c × Σ_ns (M_ns_eff × EAD_ns)
@@ -481,11 +489,15 @@ def _scva_c(inp: "CVAInput", rating_map: Optional[Dict[str, str]],
         ns_sum = 0.0
         for ns in inp.netting_sets:
             ead_ns = ns.ead * (1.0 + inp.wwr_add_on) if inp.is_wrong_way else ns.ead
-            ns_sum += _effective_maturity_discount(ns.maturity_years, rw, rfr) * ead_ns
+            # Fix 3: pass imm_bank flag to DF formula
+            df_ns = _effective_maturity_discount(ns.maturity_years, rw, rfr, imm_bank=imm_bank)
+            ns_sum += df_ns * ead_ns
         return rw * ns_sum
     else:
         ead = inp.ead * (1.0 + inp.wwr_add_on) if inp.is_wrong_way else inp.ead
-        return rw * _effective_maturity_discount(inp.maturity_years, rw, rfr) * ead
+        # Fix 3: apply IMM bank DF
+        df = _effective_maturity_discount(inp.maturity_years, rw, rfr, imm_bank=imm_bank)
+        return rw * df * inp.maturity_years * ead
 
 
 def compute_ba_cva(
@@ -493,6 +505,7 @@ def compute_ba_cva(
     rating_map: Optional[Dict[str, str]] = None,
     has_hedges: bool = False,
     market: Optional[CVAMarketConditions] = None,
+    imm_bank: bool = True,  # Fix 3 (MAR50.15(4)): True = IMM bank, DF=1
 ) -> tuple[float, Dict[str, CVAResult]]:
     """
     BA-CVA capital charge per MAR50.20–38.
@@ -514,7 +527,7 @@ def compute_ba_cva(
     scva_vals = []
 
     for inp in inputs:
-        sc      = _scva_c(inp, rating_map, rfr)
+        sc      = _scva_c(inp, rating_map, rfr, imm_bank=imm_bank)  # Fix 3
         lgd     = mkt.lgd_for_sector(inp.sector) if market else inp.lgd_mkt
         ead_eff = inp.ead * (1.0 + inp.wwr_add_on) if inp.is_wrong_way else inp.ead
         m_eff   = _effective_maturity_discount(

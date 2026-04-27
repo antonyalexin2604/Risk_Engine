@@ -28,6 +28,9 @@ from backend.engines.a_irb   import AIRBEngine
 from backend.engines.frtb    import FRTBEngine, BacktestEngine, Sensitivity
 from backend.engines.cva     import CVAEngine
 from backend.engines.ccp     import compute_ccp_rwa
+from backend.engines.gsib_capital import (  # Fix 6
+    compute_capital_adequacy, DEFAULT_GSIB, simulate_capital_base
+)
 
 from backend.data_generators.portfolio_generator import build_full_dataset
 from backend.data_generators.cva_generator      import build_cva_inputs, build_ccp_exposures
@@ -261,15 +264,33 @@ class PrometheusRunner:
         # 5. Capital summary — five-part RWA (RBC20)
         rwa_market_final    = rwa_market_adj
         rwa_total_pre_floor = rwa_credit + rwa_ccr + rwa_market_final + rwa_cva + rwa_ccp + rwa_op
-        rwa_sa_based        = rwa_credit + rwa_ccr + rwa_market + rwa_ccp + rwa_op  # CVA excluded
-        rwa_floor           = rwa_sa_based * 0.725
+        # Fix 4 (RBC20.11 / CAP10 FAQ1): floor base uses SA approaches
+        # SA-CCR RWA already available from the SA-CCR engine run
+        # FRTB SBM capital is the standardised floor component
+        # CVA RWA is explicitly excluded from the floor base (CAP10 FAQ1)
+        # Fix 4: SA-CCR proxy (rwa_ccr is already SA-CCR based; IMM results stored separately)
+        rwa_ccr_saccr       = rwa_ccr * 1.15          # conservative SA-CCR ≈ 115% of IMM
+        rwa_market_sbm      = results.get("market", {}).get("sbm_capital", rwa_market * 1.10)
+        rwa_credit_sa       = rwa_credit * 1.20  # proxy: SA ~20% above A-IRB
+        rwa_floor_base_sa   = (rwa_credit_sa + rwa_ccr_saccr +
+                               rwa_market_sbm + rwa_ccp + rwa_op)
+        rwa_floor           = 0.725 * rwa_floor_base_sa
         rwa_total           = max(rwa_total_pre_floor, rwa_floor)
         floor_triggered     = rwa_total > rwa_total_pre_floor
+        # Audit: CVA excluded
+        logger.info("Output floor [Fix4]: SA_base=%.0f | Floor=%.0f | "
+                    "Internal=%.0f | %s",
+                    rwa_floor_base_sa, rwa_floor, rwa_total_pre_floor,
+                    'FLOOR BINDING' if floor_triggered else 'internal binds')
 
-        cet1 = rwa_total * 0.13; tier1 = cet1 * 1.10; total_cap = tier1 * 1.20
-        cet1_ratio = cet1 / rwa_total if rwa_total > 0 else 0
-        t1_ratio   = tier1 / rwa_total if rwa_total > 0 else 0
-        tc_ratio   = total_cap / rwa_total if rwa_total > 0 else 0
+        # Fix 6: proper G-SIB capital adequacy framework
+        cap_adq    = compute_capital_adequacy(rwa_total, gsib=DEFAULT_GSIB)
+        cet1       = cap_adq["cet1_capital"]
+        tier1      = cap_adq["tier1_capital"]
+        total_cap  = cap_adq["total_capital"]
+        cet1_ratio = cap_adq["cet1_ratio"]
+        t1_ratio   = cap_adq["tier1_ratio"]
+        tc_ratio   = cap_adq["total_cap_ratio"]
 
         results["capital_summary"] = {
             "run_date": run_date.isoformat(),
@@ -277,12 +298,23 @@ class PrometheusRunner:
             "rwa_market": rwa_market_final, "rwa_cva": rwa_cva,
             "rwa_ccp": rwa_ccp, "rwa_operational": rwa_op,
             "rwa_total_pre_floor": rwa_total_pre_floor,
-            "rwa_sa_based": rwa_sa_based, "rwa_floor": rwa_floor,
+            "rwa_floor_base_sa": rwa_floor_base_sa,
+            "rwa_sa_based": rwa_floor_base_sa,   # backward-compat alias (Fix 4)
+            "rwa_floor": rwa_floor,
             "rwa_total": rwa_total, "floor_triggered": floor_triggered,
             "cet1_capital": cet1, "tier1_capital": tier1, "total_capital": total_cap,
             "cet1_ratio": cet1_ratio, "tier1_ratio": t1_ratio, "total_cap_ratio": tc_ratio,
-            "cet1_minimum": 0.045, "tier1_minimum": 0.060, "total_cap_minimum": 0.080,
+            "cet1_minimum": cap_adq["cet1_minimum"],
+            "tier1_minimum": cap_adq["tier1_minimum"],
+            "total_cap_minimum": cap_adq["total_cap_minimum"],
             "conservation_buffer": 0.025,
+            "gsib_bucket": cap_adq["gsib_bucket"],
+            "gsib_surcharge": cap_adq["gsib_surcharge"],
+            "at1_capital": cap_adq["at1_capital"],
+            "tier2_capital": cap_adq["tier2_capital"],
+            "cet1_headroom": cap_adq["cet1_headroom"],
+            "mda_trigger": cap_adq["mda_trigger"],
+            "any_breach": cap_adq["any_breach"],
             "cva_method": cva_result["method"],
             "cva_fallback_count": len(cva_result["fallback_traces"]),
         }

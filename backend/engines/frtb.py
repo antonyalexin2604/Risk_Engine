@@ -1823,15 +1823,35 @@ class IMACalculator:
 
     # Liquidity horizon per risk class (MAR33.12, Table 1)
     # Key = risk_class string, Value = LH in days
+    # Fix 5a (MAR33.12 Table 1): Corrected liquidity horizons
     LIQUIDITY_HORIZONS: Dict[str, int] = {
-        "GIRR":    10,
-        "FX":      10,
-        "EQ_LARGE":20,   # Large-cap equity
-        "EQ":      40,   # Small-cap equity (conservative)
-        "CSR_NS":  40,   # Credit spread non-securitisation
-        "CSR_SEC": 60,   # Credit spread securitisation
-        "CMDTY":   20,   # Commodity (liquid)
-        "CMDTY_ILLIQUID": 60,
+        # j=1 (LH=10): GIRR, major FX, specified large-cap equity
+        "GIRR":           10,
+        "GIRR_INFLATION":  10,
+        "GIRR_XCCY_BASIS": 10,
+        "FX":             10,
+        "EQ_LARGE_CAP":   10,   # Specified large-cap (MAR33.12 fn.)
+        # j=2 (LH=20): Other large-cap equity, liquid commodities
+        "EQ_LARGE":       20,
+        "CMDTY_ENERGY":   20,
+        "CMDTY_CARBON":   20,
+        "CMDTY_PRECIOUS": 20,
+        "CMDTY_NONFERROUS": 20,
+        # j=3 (LH=40): Small-cap equity, other commodities
+        "EQ":             40,
+        "EQ_SMALL":       40,
+        "CMDTY":          40,
+        "FX_OTHER":       40,
+        # j=4 (LH=60): IG credit spread (non-sec and CTP)
+        "CSR_NS_IG":      60,
+        "CSR_CTP_IG":     60,
+        "CSR_SEC_IG":     60,
+        # j=5 (LH=120): Non-IG credit, securitisation — conservative default
+        "CSR_NS":        120,   # was 40 — CORRECTED per MAR33.12
+        "CSR_NS_HY":     120,
+        "CSR_SEC":       120,   # was 60 — CORRECTED
+        "CSR_CTP_HY":    120,
+        "CMDTY_ILLIQUID": 120,
     }
     # Five liquidity horizon buckets (MAR33.4 Table 1)
     LH_BUCKETS = [10, 20, 40, 60, 120]  # j = 1..5
@@ -2291,6 +2311,8 @@ class FRTBEngine:
 
         self.sbm = SBMCalculator(self.config)
         self.ima = IMACalculator(self.config)
+        # Fix 5b: rolling 60-day ES buffer
+        self.ima_register = IMACapitalRegister()
         logger.info("FRTB Engine initialised (SBM + IMA, MAR21-33)")
 
 
@@ -2845,3 +2867,60 @@ class BacktestEngine:
             raise
         except Exception as e:
             raise FRTBCalculationError(f"Backtesting evaluation failed: {e}")
+
+
+
+
+# ─── Fix 5b (MAR33.5): 60-day rolling IMA capital register ───────────────────
+from collections import deque as _deque
+
+class IMACapitalRegister:
+    """
+    MAR33.5: IMA capital = max(ES_today, mc × ES_60d_avg)
+    mc = 1.5 + backtesting add-on (amber zone table per MAR32.9).
+    Store history in PostgreSQL via to_dict() / from_dict() for persistence.
+    """
+    AMBER_ADDON: Dict[int, float] = {
+        0:0.0,1:0.0,2:0.0,3:0.0,4:0.0,  # green zone — no add-on
+        5:0.40,6:0.50,7:0.65,8:0.75,9:0.85  # amber zone
+    }
+    MC_FLOOR = 1.5
+
+    def __init__(self, maxlen: int = 60):
+        self._hist: _deque = _deque(maxlen=maxlen)
+        self._bt_ex: int   = 0
+
+    def push(self, es: float) -> None:
+        self._hist.append(max(es, 0.0))
+
+    def set_exceptions(self, n: int) -> None:
+        self._bt_ex = n
+        if n >= 10:
+            logger.warning("IMA RED ZONE: %d exceptions — MAR32.15 disallows IMA", n)
+
+    @property
+    def mc(self) -> float:
+        return max(self.MC_FLOOR, self.MC_FLOOR + self.AMBER_ADDON.get(self._bt_ex, 0.85))
+
+    @property
+    def avg_60d(self) -> float:
+        return float(sum(self._hist) / len(self._hist)) if self._hist else 0.0
+
+    def regulatory_imcc(self, es_today: float) -> tuple:
+        """Returns (imcc, 'today'|'60d_avg')."""
+        avg_term = self.mc * self.avg_60d
+        binding  = "60d_avg" if avg_term > es_today else "today"
+        imcc     = max(es_today, avg_term)
+        logger.info("IMCC [Fix5b]: ES_today=%.0f | mc=%.2f | mc×avg=%.0f | IMCC=%.0f [%s]",
+                    es_today, self.mc, avg_term, imcc, binding)
+        return imcc, binding
+
+    def to_dict(self) -> dict:
+        return {"es_history": list(self._hist), "bt_exceptions_12m": self._bt_ex}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "IMACapitalRegister":
+        r = cls()
+        for v in d.get("es_history", []): r._hist.append(v)
+        r._bt_ex = d.get("bt_exceptions_12m", 0)
+        return r

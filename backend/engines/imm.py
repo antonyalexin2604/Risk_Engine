@@ -90,16 +90,36 @@ class CalibrationData:
 
 @dataclass
 class MarketParams:
-    """Risk-factor parameters for simulation."""
-    # Equity / FX
-    drift: float = 0.05            # μ annual
-    volatility: float = 0.20       # σ annual (historical)
-    stressed_vol: float = 0.40     # σ stressed (2007-09)
-    # Hull-White IR parameters
-    mean_reversion: float = 0.10   # κ
-    long_run_rate:  float = 0.045   # θ (OU long-run mean rate — calibrated from OIS forward curve)
-    ir_vol: float = 0.015          # σ_r
-    ir_stressed_vol: float = 0.030
+    """
+    Risk-factor parameters for Monte Carlo simulation.
+
+    Fix B (CRE53 stress calibration):
+    Per-asset-class GFC stressed volatilities replace the prior
+    single `stressed_vol = 2 × base_vol` shortcut. Sources:
+      EQ  0.38 — S&P 500 realized vol 2007-09 (CBOE VIX avg ~32%, realized ~38%)
+      FX  0.18 — Major pair realized vol 2007-09 (EURUSD ~15-18%)
+      IR  0.020— 10Y UST absolute rate vol 2007-09 (~120-200bp/yr; σ_r = 0.020)
+      CR  0.65 — IG CDX credit-spread log-vol 2007-09 (spread 70bp→280bp)
+      CMDTY 0.58— WTI realized vol 2007-09 (oil $147→$35; daily vol ~3.5%)
+    """
+    # ── Equity ────────────────────────────────────────────────────────────
+    drift:          float = 0.05   # μ annual (risk-neutral drift)
+    volatility:     float = 0.20   # EQ σ base (historical realized; backward-compat alias)
+    stressed_vol:   float = 0.38   # EQ σ stressed GFC 2007-09 (was 0.40 = 2×base)
+    # ── FX ────────────────────────────────────────────────────────────────
+    fx_vol:          float = 0.10  # FX σ base (major pairs ~8-12% annual)
+    fx_stressed_vol: float = 0.18  # FX σ GFC 2007-09 (EURUSD realized ~15-18%)
+    # ── Interest Rate (Hull-White) ─────────────────────────────────────────
+    mean_reversion:  float = 0.10  # κ — mean-reversion speed
+    long_run_rate:   float = 0.045 # θ — OU long-run mean (calibrate from OIS fwd curve)
+    ir_vol:          float = 0.015 # σ_r base (absolute rate std, e.g. 1.5%/yr)
+    ir_stressed_vol: float = 0.020 # σ_r GFC 2007-09 (was 0.030=2×base; empirical 0.018-0.022)
+    # ── Credit Spread (GBM on spread level) ───────────────────────────────
+    cr_vol:          float = 0.30  # CR σ base (IG spread log-vol ~25-30%/yr)
+    cr_stressed_vol: float = 0.65  # CR σ GFC 2007-09 (IG CDX tripled in 18m)
+    # ── Commodity ─────────────────────────────────────────────────────────
+    cmdty_vol:          float = 0.25  # CMDTY σ base (energy ~20-25%/yr)
+    cmdty_stressed_vol: float = 0.58  # CMDTY σ GFC 2007-09 (WTI realized ~58%/yr)
     # Correlations: factor model
     # correlation_matrix: (N_factors + 1) × (N_factors + 1)
     # Factors: [EQ, FX, IR, CR, CMDTY, Market]
@@ -113,9 +133,29 @@ class MarketParams:
     ]))
     
     def validate(self) -> None:
-        """Validate correlation matrix is symmetric positive-definite."""
-        if self.volatility <= 0 or self.ir_vol <= 0:
-            raise IMMValidationError("Volatilities must be positive")
+        """Validate all vol parameters and correlation matrix."""
+        # Base vols
+        for name, val in [
+            ("volatility (EQ base)",   self.volatility),
+            ("ir_vol",                 self.ir_vol),
+            ("fx_vol",                 self.fx_vol),
+            ("cr_vol",                 self.cr_vol),
+            ("cmdty_vol",              self.cmdty_vol),
+        ]:
+            if val <= 0:
+                raise IMMValidationError(f"{name} must be positive, got {val}")
+        # Stressed vols must be >= base (GFC is always worse than base)
+        for base, stress, label in [
+            (self.volatility,  self.stressed_vol,       "EQ"),
+            (self.fx_vol,      self.fx_stressed_vol,    "FX"),
+            (self.ir_vol,      self.ir_stressed_vol,    "IR"),
+            (self.cr_vol,      self.cr_stressed_vol,    "CR"),
+            (self.cmdty_vol,   self.cmdty_stressed_vol, "CMDTY"),
+        ]:
+            if stress < base:
+                raise IMMValidationError(
+                    f"{label} stressed vol ({stress:.4f}) must be >= base vol ({base:.4f})"
+                )
         if self.mean_reversion <= 0:
             raise IMMValidationError("Mean reversion must be positive")
         # Check symmetry
@@ -453,32 +493,90 @@ class MonteCarloEngine:
             ac = t.asset_class
             n  = t.notional
             d  = t.direction
-            v_stress = (self.p.stressed_vol if stressed else self.p.volatility)
 
-            # Use trade-specific cache key that includes stress flag
+            # Fix B3: per-asset-class vol dispatch (CRE53 stress calibration)
+            # Each asset class uses its own empirically-calibrated GFC stressed vol
+            # instead of a single `stressed_vol = 2 × base_vol` shortcut.
+            if stressed:
+                vol_map = {
+                    "EQ":    self.p.stressed_vol,        # 0.38 — S&P 500 GFC 2007-09
+                    "FX":    self.p.fx_stressed_vol,     # 0.18 — major pair GFC
+                    "IR":    self.p.ir_stressed_vol,     # 0.020— 10Y UST σ_r GFC
+                    "CR":    self.p.cr_stressed_vol,     # 0.65 — IG CDX GFC
+                    "CMDTY": self.p.cmdty_stressed_vol,  # 0.58 — WTI GFC
+                }
+            else:
+                vol_map = {
+                    "EQ":    self.p.volatility,          # 0.20 base
+                    "FX":    self.p.fx_vol,              # 0.10 base
+                    "IR":    self.p.ir_vol,              # 0.015 base
+                    "CR":    self.p.cr_vol,              # 0.30 base
+                    "CMDTY": self.p.cmdty_vol,           # 0.25 base
+                }
+            ac_vol = vol_map.get(ac, self.p.volatility)
+
+            # Trade-specific cache key includes stress flag to prevent cross-run contamination
             cache_key = f"{ac}_{id(t)}_{('stressed' if stressed else 'base')}"
-            
-            if ac in ("EQ", "FX", "CMDTY"):
+
+            if ac == "EQ":
                 if cache_key not in path_cache:
                     path_cache[cache_key] = self.simulate_gbm(
-                        S0=1.0, vol=v_stress, asset_class=ac
+                        S0=1.0, vol=ac_vol, asset_class="EQ"
                     )
                 paths = path_cache[cache_key]
                 mtm = n * d * (paths - 1.0)
-            
-            elif ac == "IR":
-                ir_v = (self.p.ir_stressed_vol if stressed else self.p.ir_vol)
+
+            elif ac == "FX":
                 if cache_key not in path_cache:
-                    path_cache[cache_key] = self.simulate_hull_white(vol=ir_v)
+                    path_cache[cache_key] = self.simulate_gbm(
+                        S0=1.0, vol=ac_vol, asset_class="FX"
+                    )
+                paths = path_cache[cache_key]
+                mtm = n * d * (paths - 1.0)
+
+            elif ac == "IR":
+                if cache_key not in path_cache:
+                    path_cache[cache_key] = self.simulate_hull_white(vol=ac_vol)
                 r_paths = path_cache[cache_key]
                 dur = max((t.maturity_date - date.today()).days / 365.0, 0.1)
                 convex = 0.05 * (dur ** 2) / 100
                 bond_ret = np.array([
-                    self._bond_price(r, dur, convex) - 1.0 
+                    self._bond_price(r, dur, convex) - 1.0
                     for r in r_paths.flatten()
                 ]).reshape(r_paths.shape)
                 mtm = n * d * bond_ret
-            
+
+            elif ac == "CR":
+                # Fix B3: credit exposure via GBM on spread level (CRE53).
+                # Previously this fell to else → zeros, understating CCR for CDS/TRS.
+                #
+                # MTM formula (consistent with market_state.price_cds_trade):
+                #   MTM = direction × notional × ΔSpread × duration
+                #   where ΔSpread = s₀ × (S_t/S₀ − 1)  (spread_paths gives the ratio)
+                #
+                # s₀ = 90bp (0.0090) — IG reference spread from _REF_LEVELS['CS_IG'].
+                # This is the key scaling factor that was missing: without it, the
+                # formula would compute MTM as a fraction of full notional rather than
+                # a fraction of the spread × duration DV01.
+                if cache_key not in path_cache:
+                    path_cache[cache_key] = self.simulate_gbm(
+                        S0=1.0, vol=ac_vol, asset_class="CR"
+                    )
+                spread_paths = path_cache[cache_key]     # S_t / S₀ ratio
+                dur_cr       = max((t.maturity_date - date.today()).days / 365.0, 0.25)
+                dur_approx   = min(dur_cr, 5.0) * 0.85  # DV01 proxy (capped at 5yr × 85%)
+                s0_ig        = 0.0090                    # 90bp IG reference (CS_IG in market_state)
+                # delta_spread = s0 × (ratio − 1); MTM = notional × direction × delta_spread × duration
+                mtm = n * d * s0_ig * (spread_paths - 1.0) * dur_approx
+
+            elif ac == "CMDTY":
+                if cache_key not in path_cache:
+                    path_cache[cache_key] = self.simulate_gbm(
+                        S0=1.0, vol=ac_vol, asset_class="CMDTY"
+                    )
+                paths = path_cache[cache_key]
+                mtm = n * d * (paths - 1.0)
+
             else:
                 mtm = np.zeros((n_scenarios, self.T))
 
@@ -1026,6 +1124,24 @@ class IMMEngine:
             eee[t] = max(ee[t], eee[t-1])
         return eee
 
+    def _eepe_one_year(self, eee: np.ndarray, time_grid: np.ndarray) -> float:
+        """
+        Fix 2 (CRE53 §EEPE): EEPE = time-weighted average of Effective EE
+        over [0, min(1yr, trade_maturity)] — NOT the full simulation horizon.
+
+        EEPE = (1/T*) × Σ_{t_k ≤ T*} EEE(t_k) × Δt_k   where T* = 1 year.
+        """
+        T_STAR = 1.0
+        mask   = time_grid <= T_STAR
+        if not np.any(mask):
+            return float(eee[0])
+        t_nodes = time_grid[mask]
+        e_nodes = eee[mask]
+        t_prev  = np.concatenate([[0.0], t_nodes[:-1]])
+        dt      = t_nodes - t_prev
+        total_t = float(t_nodes[-1]) if float(t_nodes[-1]) > 0.0 else T_STAR
+        return max(float(np.dot(e_nodes, dt)) / total_t, 0.0)
+
     def compute_exposure_profile(
         self, trades: List[Trade], run_date: Optional[date] = None
     ) -> ExposureProfile:
@@ -1050,7 +1166,8 @@ class IMMEngine:
         pfe  = np.percentile(exposure_paths, 95, axis=0)
         eee  = self._effective_ee(ee)
         epe  = float(ee.mean())
-        eepe = float(eee.mean())
+        # Fix 2 (CRE53 §EEPE): average over first year only
+        eepe = self._eepe_one_year(eee, self._time_grid())
         ead  = self.alpha * eepe
 
         # --- stressed simulation (2007-09 calibration) ---
@@ -1058,7 +1175,8 @@ class IMMEngine:
         stressed_paths, _ = self.mc.simulate_netting_set(trades, stressed=True, cached_paths=None)
         stressed_ee    = stressed_paths.mean(axis=0)
         stressed_eee   = self._effective_ee(stressed_ee)
-        s_eepe = float(stressed_eee.mean())
+        # Fix 2: stressed EEPE also uses one-year window
+        s_eepe = self._eepe_one_year(stressed_eee, self._time_grid())
         s_ead  = self.alpha * s_eepe
 
         elapsed = time.perf_counter() - t0
@@ -1082,8 +1200,20 @@ class IMMEngine:
         )
 
     def compute_rwa(self, profile: ExposureProfile, risk_weight: float = 1.0) -> float:
-        """RWA = 12.5 × capital_charge; simplified: RWA = EAD × RW × 12.5 × 8%."""
-        return profile.ead * risk_weight * 12.5 * 0.08
+        """
+        Fix 1 (CRE51.15): RWA = max(EAD_current, EAD_stressed) × RW × 12.5 × 8%.
+        The stressed run must bind when stressed_ead > current ead.
+        """
+        ead_regulatory = max(profile.ead, profile.stressed_ead)
+        if profile.stressed_ead > profile.ead:
+            logger.info(
+                "Fix 1 [CRE51.15]: Stressed EAD (%.0f) > Current EAD (%.0f) — "
+                "stressed calibration binds (Δ=+%.1f%%)",
+                profile.stressed_ead, profile.ead,
+                100.0 * (profile.stressed_ead - profile.ead) / profile.ead
+                if profile.ead > 0 else 0.0,
+            )
+        return ead_regulatory * risk_weight * 12.5 * 0.08
 
     def compute_cva_metrics(self, trades: List[Trade], profile: ExposureProfile,
                            cds_spread: float = 0.0050) -> PerformanceMetrics:
@@ -1259,16 +1389,19 @@ class IMMEngine:
             eee = self._effective_ee(ee)
             pfe = np.percentile(exposure_paths, 95, axis=0)
             
+            # Fix A (CRE51.15 / CRE53): use _eepe_one_year for stress scenario
+            _tg   = self._time_grid()
+            _eepe = self._eepe_one_year(eee, _tg)
             results[scenario_name] = ExposureProfile(
-                time_grid=self._time_grid(),
+                time_grid=_tg,
                 ee_profile=ee,
                 eee_profile=eee,
                 pfe_95=pfe,
                 epe=float(ee.mean()),
-                eepe=float(eee.mean()),
-                ead=self.alpha * float(eee.mean()),
-                stressed_eepe=float(eee.mean()),
-                stressed_ead=self.alpha * float(eee.mean()),
+                eepe=_eepe,
+                ead=self.alpha * _eepe,
+                stressed_eepe=_eepe,
+                stressed_ead=self.alpha * _eepe,
             )
             
             elapsed = time.perf_counter() - t0
@@ -1298,6 +1431,8 @@ class IMMEngine:
                 "eepe": profile.eepe,
                 "eee": float(profile.eee_profile[-1]),
                 "ead_imm": profile.ead,
+            "ead_regulatory": max(profile.ead, profile.stressed_ead),
+            "stressed_binding": profile.stressed_ead > profile.ead,
                 "rwa_imm": self.compute_rwa(profile),
                 "stressed_eepe": profile.stressed_eepe,
                 "stressed_ead": profile.stressed_ead,
@@ -1424,6 +1559,8 @@ class IMMEngine:
             "eepe": profile.eepe,
             "eee": float(profile.eee_profile[-1]),
             "ead_imm": profile.ead,
+            "ead_regulatory": max(profile.ead, profile.stressed_ead),  # Fix 1 (CRE51.15)
+            "stressed_binding": profile.stressed_ead > profile.ead,
             "rwa_imm": self.compute_rwa(profile),
             "stressed_eepe": profile.stressed_eepe,
             "stressed_ead": profile.stressed_ead,

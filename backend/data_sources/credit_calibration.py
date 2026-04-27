@@ -323,3 +323,54 @@ def validate_rtm() -> bool:
 
 # Run validation at import — fails loudly if the matrix is corrupted
 validate_rtm()
+
+
+
+
+# ─── Fix 7 (CRE36.63 / CRE36.77): Long-run average TtC PD calibration ────────
+# Source: S&P Global Ratings Annual Default Study 2023 (1981-2022, 42 years)
+# These are THROUGH-THE-CYCLE averages — suitable for A-IRB regulatory PD.
+# Update annually from S&P / Moody's / Fitch annual default study.
+LRA_PD_TTC: Dict[str, float] = {
+    "AAA": 0.00000,   # 0.00% — 0 defaults in 42yr S&P sample
+    "AA":  0.00022,   # 0.02%
+    "A":   0.00071,   # 0.07%
+    "BBB": 0.00209,   # 0.21%
+    "BB":  0.00969,   # 0.97%
+    "B":   0.04462,   # 4.46%
+    "CCC": 0.26949,   # 26.95%
+    "NR":  0.00209,   # NR → BBB equivalent (conservative mid-IG)
+}
+
+_DEFAULT_PIT_WEIGHT: float = 0.20  # 20% PiT, 80% TtC (CRE36.77: lean TtC)
+
+def pd_from_rating_ttc(
+    rating: str,
+    horizon_years: float = 1.0,
+    pit_pd: Optional[float] = None,
+    pit_weight: float = _DEFAULT_PIT_WEIGHT,
+) -> float:
+    """
+    Fix 7 (CRE36.63): Through-the-cycle PD for A-IRB regulatory capital.
+
+    Anchors to S&P 42-year LRA-PD.  If the bank has an internal PiT PD,
+    blends: TtC_PD = (1 - w) × LRA_PD + w × PiT_PD  (w = pit_weight = 0.20).
+    Horizon scaling uses survival probability: P(T) = 1 − (1 − P_1yr)^T.
+    Clamped to [PD_FLOOR=3bp, 99.9%] per CRE31.17.
+    """
+    from functools import lru_cache as _lru
+    broad = rating.strip().upper().replace("+","").replace("-","")
+    broad = {"BAA":"BBB","BA":"BB","CA":"CCC","CAA":"CCC"}.get(broad, broad)
+    if broad not in LRA_PD_TTC:
+        broad = "NR"
+    lra = LRA_PD_TTC[broad]
+    if pit_pd is not None and pit_pd > 0:
+        pit_c   = max(_PD_FLOOR, min(pit_pd, 1.0))
+        ttc_1yr = (1.0 - pit_weight) * lra + pit_weight * pit_c
+    else:
+        ttc_1yr = lra
+    if horizon_years != 1.0 and horizon_years > 0:
+        ttc_h = 1.0 - max(1.0 - ttc_1yr, 0.0) ** horizon_years
+    else:
+        ttc_h = ttc_1yr
+    return max(_PD_FLOOR, min(ttc_h, _PD_CAP))
