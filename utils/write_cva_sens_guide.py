@@ -479,7 +479,7 @@ The closed-form CCSR approximation in cva.py remains valid as a baseline; full A
 replaces it for the complete SA-CVA implementation.
 """
 
-with open('/Users/aaron/Documents/Project/Prometheus/docs/CVA_SENSITIVITIES_TECHNICAL_GUIDE.md', 'w') as f:
+with open('/docs/Requirements/CVA_SENSITIVITIES_TECHNICAL_GUIDE.md', 'w') as f:
     f.write(content)
 print("CVA Sensitivities guide written successfully.")
 

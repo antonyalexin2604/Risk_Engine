@@ -366,7 +366,7 @@ Banks with large retail or wealth management businesses should prioritise CPBP c
 conduct risk monitoring as the primary operational risk management lever.
 """
 
-with open('/Users/aaron/Documents/Project/Prometheus/docs/OPERATIONAL_RISK_TECHNICAL_GUIDE.md', 'w') as f:
+with open('/docs/Requirements/OPERATIONAL_RISK_TECHNICAL_GUIDE.md', 'w') as f:
     f.write(content)
 print("Operational Risk guide written successfully.")
 
