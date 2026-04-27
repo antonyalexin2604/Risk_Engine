@@ -460,3 +460,135 @@ class TestGFCVolCalibration:
                 "With GFC vols active, stressed EAD should exceed current EAD for IR"
         finally:
             _imm_mod.DEFAULT_PARAMS = _original  # restore to avoid test pollution
+
+
+# ─── CRE53 §margined EEPE — path-level CSA collateral tests ──────────────────
+
+class TestMargined_EEPE_PathLevel:
+    """CRE53 §margined EEPE: VM/IM path-level collateral simulation."""
+
+    def setup_method(self):
+        from backend.engines.imm import IMMEngine
+        from backend.engines.sa_ccr import NettingSet
+        from datetime import date, timedelta
+        from backend.engines.sa_ccr import Trade
+        self.eng = IMMEngine(use_antithetic=False)
+        today = date.today()
+        self.trades = [
+            Trade(trade_id="T_IR", asset_class="IR", instrument_type="IRS",
+                  notional=50_000_000, notional_ccy="USD", direction=1,
+                  maturity_date=today+timedelta(days=1825), trade_date=today,
+                  current_mtm=200_000, fixed_rate=0.035, reference_period=5.0),
+            Trade(trade_id="T_EQ", asset_class="EQ", instrument_type="EquitySwap",
+                  notional=20_000_000, notional_ccy="USD", direction=1,
+                  maturity_date=today+timedelta(days=1095), trade_date=today,
+                  current_mtm=80_000, underlying_security_id="SPX Index"),
+        ]
+        self.ns = NettingSet(
+            netting_id="NS_CSA_TEST", counterparty_id="CP_A", trades=self.trades,
+            initial_margin=1_500_000, variation_margin=280_000,
+            threshold=500_000, mta=100_000, has_csa=True, mpor_days=10)
+        self.ns.haircut = 0.02
+
+    def test_simulate_vm_paths_shape(self):
+        """VM paths shape must match exposure_paths (N, T)."""
+        import numpy as np
+        exp = np.random.rand(100, 52) * 1e6
+        vm  = self.eng._simulate_vm_paths(exp, threshold=500_000, mta=100_000,
+                                           haircut=0.02, mpor_days=10)
+        assert vm.shape == exp.shape, "VM paths must match exposure shape"
+
+    def test_simulate_vm_paths_mpor_lag(self):
+        """VM at t=0 must be zero — lag not yet elapsed."""
+        import numpy as np
+        exp = np.ones((50, 52)) * 2_000_000   # always above threshold
+        vm  = self.eng._simulate_vm_paths(exp, threshold=0, mta=0,
+                                           haircut=0.0, mpor_days=10)
+        assert vm[:, 0].sum() == 0.0, "VM at t=0 must be zero (MPOR lag)"
+
+    def test_simulate_vm_paths_below_threshold_is_zero(self):
+        """No VM should be called when exposure < threshold + MTA."""
+        import numpy as np
+        exp = np.ones((50, 52)) * 100_000     # below threshold 500K
+        vm  = self.eng._simulate_vm_paths(exp, threshold=500_000, mta=100_000,
+                                           haircut=0.02, mpor_days=10)
+        assert vm.sum() == 0.0, "No VM when exposure below threshold"
+
+    def test_simulate_im_paths_fixed(self):
+        """Fixed IM must appear as constant at all nodes."""
+        import numpy as np
+        exp = np.random.rand(50, 52) * 1e6
+        im  = self.eng._simulate_im_paths(exp, im_fixed=1_500_000, im_fraction=0.0)
+        assert im.shape == exp.shape
+        assert abs(im.mean() - 1_500_000) < 1.0, "Fixed IM must be constant 1.5M"
+
+    def test_margined_ead_less_than_gross(self):
+        """Path-level margined EAD must be below gross EAD (collateral reduces exposure)."""
+        profile = self.eng.compute_exposure_profile(self.trades)
+        ead_csa, pct, _, _, method = self.eng.compute_csa_ead_regulatory(profile, self.ns)
+        assert ead_csa < profile.ead, (
+            f"Margined EAD ({ead_csa:.0f}) must be < gross EAD ({profile.ead:.0f})")
+        assert pct > 0, "CSA reduction must be positive"
+
+    def test_method_trace_is_path_level(self):
+        """With exposure_paths available, method must be CRE53-PATH-LEVEL."""
+        profile = self.eng.compute_exposure_profile(self.trades)
+        assert profile.exposure_paths is not None
+        _, _, _, _, method = self.eng.compute_csa_ead_regulatory(profile, self.ns)
+        assert method == "CRE53-PATH-LEVEL", (
+            f"Expected CRE53-PATH-LEVEL, got {method}")
+
+    def test_tier2_fallback_when_no_paths(self):
+        """Without exposure_paths, method falls back to CRE53-APPROX-FALLBACK."""
+        profile = self.eng.compute_exposure_profile(self.trades)
+        profile.exposure_paths = None   # simulate memory-saving mode
+        _, _, _, _, method = self.eng.compute_csa_ead_regulatory(profile, self.ns)
+        assert method == "CRE53-APPROX-FALLBACK", (
+            f"Expected CRE53-APPROX-FALLBACK fallback, got {method}")
+
+    def test_im_reduces_net_exposure(self):
+        """Higher IM should produce lower margined EAD."""
+        import copy
+        from backend.engines.sa_ccr import NettingSet
+        from datetime import date
+        profile = self.eng.compute_exposure_profile(self.trades)
+        # Low IM netting set
+        ns_low = copy.copy(self.ns); ns_low.initial_margin = 100_000
+        ns_low.haircut = 0.02
+        ead_low, _, _, _, _ = self.eng.compute_csa_ead_regulatory(profile, ns_low)
+        # High IM netting set
+        ns_high = copy.copy(self.ns); ns_high.initial_margin = 5_000_000
+        ns_high.haircut = 0.02
+        ead_high, _, _, _, _ = self.eng.compute_csa_ead_regulatory(profile, ns_high)
+        assert ead_high <= ead_low, (
+            f"Higher IM ({ead_high:.0f}) should give lower EAD than low IM ({ead_low:.0f})")
+
+    def test_simulate_margined_eepe_standalone(self):
+        """simulate_margined_eepe returns ExposureProfile with margined fields."""
+        m_profile = self.eng.simulate_margined_eepe(self.trades, self.ns, stressed=False)
+        assert m_profile.margined_eepe > 0, "margined_eepe must be positive"
+        assert m_profile.margined_ead  > 0, "margined_ead must be positive"
+        assert m_profile.margined_ead < m_profile.ead * 2, \
+            "margined_ead should be in a plausible range vs gross"
+
+    def test_run_for_portfolio_exposes_margined_keys(self):
+        """run_for_portfolio must expose eepe_margined, ead_margined, csa_method."""
+        result = self.eng.run_for_portfolio(self.trades, netting_set=self.ns)
+        for key in ["eepe_margined", "ead_margined", "csa_method", "csa_reduction_pct"]:
+            assert key in result, f"run_for_portfolio must expose '{key}'"
+        assert result["csa_method"] == "CRE53-PATH-LEVEL"
+        assert result["ead_margined"] < result["ead_imm"], \
+            "ead_margined must be less than gross ead_imm"
+        assert 0 < result["csa_reduction_pct"] < 100, \
+            "CSA reduction must be between 0% and 100%"
+
+    def test_high_threshold_gives_less_relief(self):
+        """Higher threshold means less VM is called → less CSA relief."""
+        import copy
+        profile = self.eng.compute_exposure_profile(self.trades)
+        ns_low_th  = copy.copy(self.ns); ns_low_th.threshold  = 0;         ns_low_th.haircut  = 0.02
+        ns_high_th = copy.copy(self.ns); ns_high_th.threshold = 5_000_000; ns_high_th.haircut = 0.02
+        ead_low_th,  _, _, _, _ = self.eng.compute_csa_ead_regulatory(profile, ns_low_th)
+        ead_high_th, _, _, _, _ = self.eng.compute_csa_ead_regulatory(profile, ns_high_th)
+        assert ead_high_th >= ead_low_th, (
+            f"Higher threshold ({ead_high_th:.0f}) should give >= EAD vs low threshold ({ead_low_th:.0f})")

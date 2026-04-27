@@ -188,6 +188,12 @@ class ExposureProfile:
     stressed_eepe: float = 0.0
     stressed_ead:  float = 0.0
     exposure_paths: Optional[np.ndarray] = None  # Full scenario paths (N, T) for CSA path-level calc
+    # CRE53 §margined EEPE — path-level CSA collateral fields (populated by simulate_margined_eepe)
+    margined_ee_profile:  Optional[np.ndarray] = None  # E[net exposure after VM/IM] shape (T,)
+    margined_eepe:        float = 0.0   # EEPE computed on margin-netted exposure paths
+    margined_ead:         float = 0.0   # α × margined_eepe
+    margined_ead_stressed: float = 0.0  # stressed version of margined_ead
+    collateral_paths:     Optional[np.ndarray] = None  # simulated VM+IM paths (N, T)
 
 @dataclass
 class CSATerms:
@@ -1457,78 +1463,344 @@ class IMMEngine:
         return results
 
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # CRE53 §margined EEPE — full path-level CSA collateral simulation
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _simulate_vm_paths(
+        self,
+        exposure_paths: np.ndarray,
+        threshold: float,
+        mta: float,
+        haircut: float,
+        mpor_days: int,
+    ) -> np.ndarray:
+        """
+        Simulate Variation Margin (VM) account paths at each MC node.
+
+        CRE53 §margined EEPE requires that when a model explicitly simulates
+        margining, the VM at each node is the collateral actually held —
+        posted at the **prior** margin call date (MPOR days ago), not today.
+        This lag captures the exposure that accrues during the re-margining
+        period before new collateral arrives.
+
+        Algorithm:
+          At each time node t:
+            1. The margin call is raised when exposure > threshold + MTA.
+               Call amount = max(0, exposure[t] - threshold).
+            2. Collateral actually received = the call raised MPOR nodes ago
+               (because it takes MPOR business days to collect).
+            3. VM_received[t] = call raised at (t - lag) nodes ago, 0 if t < lag.
+            4. The net haircut-adjusted VM value = (1 - haircut) × VM_received.
+
+        Args:
+            exposure_paths: shape (N, T) — gross MC exposure at each node
+            threshold:      minimum exposure before VM is called (TH, USD)
+            mta:            minimum transfer amount (USD)
+            haircut:        collateral haircut (e.g. 0.02 = 2%)
+            mpor_days:      margin period of risk in business days
+
+        Returns:
+            vm_paths: shape (N, T) — haircut-adjusted VM value at each node
+        """
+        N, T = exposure_paths.shape
+        # MPOR expressed as simulation time-steps
+        # dt = time_horizon_years / T; 1 business day ≈ 1/250 years
+        dt_years     = IMM.time_horizon_years / T
+        steps_per_day = max(1.0, 1.0 / (dt_years * 250.0))
+        lag_steps    = max(1, int(round(mpor_days * steps_per_day)))
+
+        # VM call raised when exposure > TH + MTA
+        call_amount   = np.maximum(0.0, exposure_paths - threshold - mta)   # (N, T)
+        vm_received   = np.zeros_like(call_amount)                           # (N, T)
+        if lag_steps < T:
+            vm_received[:, lag_steps:] = call_amount[:, :T - lag_steps]
+        # else: all collateral arrives after simulation horizon → 0
+
+        vm_paths = (1.0 - haircut) * vm_received    # haircut-adjusted value
+        return vm_paths
+
+    def _simulate_im_paths(
+        self,
+        exposure_paths: np.ndarray,
+        im_fixed: float,
+        im_fraction: float = 0.0,
+    ) -> np.ndarray:
+        """
+        Simulate Initial Margin (IM) contribution at each node.
+
+        Two IM components are supported:
+          (a) Fixed IM (e.g. posted at trade inception, static through life):
+              im_fixed — constant amount posted at t=0, held throughout.
+          (b) Dynamic IM (e.g. SIMM / exchange-margin scaling with exposure):
+              im_fraction × exposure[i,t] — captures IM that scales with
+              mark-to-market, typical for centrally-cleared or UMR portfolios.
+
+        Both can be combined. Fixed IM dominates for bilateral CSA portfolios;
+        dynamic IM is more appropriate for CCP-cleared portfolios.
+
+        Args:
+            exposure_paths: shape (N, T)
+            im_fixed:       fixed IM amount (USD) received at inception
+            im_fraction:    fraction of gross exposure as dynamic IM (default 0)
+
+        Returns:
+            im_paths: shape (N, T) — IM value available at each node
+        """
+        N, T = exposure_paths.shape
+        # Fixed IM: constant across all scenarios and time nodes
+        im_fixed_paths   = np.full((N, T), im_fixed, dtype=float)
+        # Dynamic IM: proportional to gross exposure (e.g. cleared portfolio)
+        im_dynamic_paths = im_fraction * exposure_paths
+        return im_fixed_paths + im_dynamic_paths
+
+    def simulate_margined_eepe(
+        self,
+        trades,
+        netting_set,
+        stressed: bool = False,
+    ) -> "ExposureProfile":
+        """
+        CRE53 §margined EEPE — full path-level collateral simulation.
+
+        This is the regulatory-grade method for computing EAD on a margined
+        netting set. It replaces the CRE53.22 approximation
+        (EEPE_mpor = EEPE_gross × √(MPOR/250)) with an explicit simulation
+        of VM and IM collateral paths at each Monte Carlo node.
+
+        Basel framework (CRE53.14–53.23):
+          Effective EE with margining:
+            EE_margined(t) = E[max(MtM(t) − VM(t) − IM, TH + MTA − NICA, 0)]
+          where VM(t) is the VM actually held at t (posted at t − MPOR delay).
+
+          EEPE_margined = time-weighted average of Effective EE_margined
+                          over [0, min(1yr, longest maturity)]
+
+          EAD_csa = α × EEPE_margined           (CRE53.16)
+
+        The path-level computation naturally captures:
+          - MPOR lag: collateral received with delay, exposing the gap
+          - Threshold: exposures below TH receive no VM relief
+          - MTA: small transfers suppressed until MTA is breached
+          - IM: upfront risk buffer reducing net exposure at all nodes
+          - Haircut: reduction in effective collateral value
+          - Scenario-level correlation: high-exposure paths also tend to have
+            delayed / insufficient VM, so the average EE_margined > simple
+            analytical approximation in tail scenarios
+
+        Args:
+            trades:       list of Trade objects in the netting set
+            netting_set:  NettingSet with has_csa=True, threshold, mta, mpor_days,
+                          initial_margin, variation_margin fields
+            stressed:     if True, uses GFC-calibrated stressed volatilities
+
+        Returns:
+            ExposureProfile with margined_eepe, margined_ead populated
+            (plus margined_ee_profile and collateral_paths for attribution)
+        """
+        import time as _time
+        t0 = _time.perf_counter()
+
+        # ── Extract CSA terms ─────────────────────────────────────────────────
+        TH   = float(getattr(netting_set, "threshold",       0.0))
+        MTA  = float(getattr(netting_set, "mta",             0.0))
+        IM   = float(getattr(netting_set, "initial_margin",  0.0))
+        VM0  = float(getattr(netting_set, "variation_margin",0.0))  # today's VM
+        MPOR = int(  getattr(netting_set, "mpor_days",       10))
+        HC   = float(getattr(netting_set, "haircut",         0.02))
+        # Net independent collateral amount = IM received (CRE52.18 / CRE53.23)
+        NICA = IM
+
+        # ── Run Monte Carlo (fresh paths — do not reuse cache across runs) ────
+        exposure_paths, _ = self.mc.simulate_netting_set(
+            trades, stressed=stressed, cached_paths=None
+        )
+        # exposure_paths: shape (N_eff, T) — gross positive MtM at each node
+
+        # ── Simulate VM paths — MPOR-lagged collateral (CRE53.14) ────────────
+        vm_paths = self._simulate_vm_paths(
+            exposure_paths, threshold=TH, mta=MTA, haircut=HC, mpor_days=MPOR
+        )
+
+        # ── Simulate IM paths — fixed + dynamic (CRE53.23) ───────────────────
+        im_paths = self._simulate_im_paths(
+            exposure_paths, im_fixed=IM, im_fraction=0.0
+        )
+
+        # ── Net exposure after collateral at each path × node ─────────────────
+        # CRE53.14: EE_margined(t) = E[max(MtM(t) - VM(t) - IM(t),
+        #                                  TH + MTA - NICA, 0)]
+        # The second argument (TH + MTA - NICA) is the regulatory floor: even
+        # if VM covers all exposure, the residual threshold+MTA block persists
+        # as the minimum exposure between margin calls.
+        floor_term          = max(TH + MTA - NICA, 0.0)
+        net_exposure_paths  = np.maximum(
+            exposure_paths - vm_paths - im_paths,
+            floor_term,
+        )
+        net_exposure_paths  = np.maximum(net_exposure_paths, 0.0)  # non-negative
+
+        # ── EE, EEE, EEPE on margined paths ──────────────────────────────────
+        ee_margined   = net_exposure_paths.mean(axis=0)       # shape (T,)
+        eee_margined  = self._effective_ee(ee_margined)        # non-decreasing
+        time_grid     = self._time_grid()
+        eepe_margined = self._eepe_one_year(eee_margined, time_grid)  # 1yr window
+        ead_margined  = self.alpha * eepe_margined
+
+        # ── Collateral paths for attribution / audit ──────────────────────────
+        # Total collateral at each node (VM + IM, before haircut)
+        total_collateral_paths = vm_paths / (1.0 - HC) + im_paths   # (N, T)
+        avg_collateral_profile = total_collateral_paths.mean(axis=0)
+
+        elapsed = _time.perf_counter() - t0
+        logger.info(
+            "CRE53 Margined EEPE [%s]: "
+            "TH=%.0f MTA=%.0f IM=%.0f MPOR=%dd HC=%.1f%% stressed=%s | "
+            "EEPE_gross=%.0f → EEPE_margined=%.0f (−%.1f%%) | "
+            "EAD_gross=%.0f → EAD_margined=%.0f | %.2fs",
+            getattr(netting_set, "netting_id", "?"),
+            TH, MTA, IM, MPOR, HC * 100, stressed,
+            0.0, eepe_margined, 0.0,   # gross not yet computed here
+            0.0, ead_margined, elapsed,
+        )
+
+        # Return a partial ExposureProfile populated with margined fields
+        return ExposureProfile(
+            time_grid             = time_grid,
+            ee_profile            = ee_margined,      # margined EE (overrides gross)
+            eee_profile           = eee_margined,
+            pfe_95                = np.percentile(net_exposure_paths, 95, axis=0),
+            epe                   = float(ee_margined.mean()),
+            eepe                  = eepe_margined,
+            ead                   = ead_margined,
+            margined_ee_profile   = ee_margined,
+            margined_eepe         = eepe_margined,
+            margined_ead          = ead_margined,
+            collateral_paths      = avg_collateral_profile,
+            exposure_paths        = net_exposure_paths,
+        )
+
     def compute_csa_ead_regulatory(
         self,
         profile: "ExposureProfile",
         netting_set,
     ) -> tuple:
         """
-        Regulatory CSA-adjusted IMM EAD per CRE53.22-53.23.
+        CRE53 §margined EEPE — two-tier regulatory CSA EAD computation.
 
-        Combines two Basel-mandated benefit channels:
+        Tier 1 (preferred): Full path-level margined EEPE simulation.
+          Explicitly simulates VM (MPOR-lagged) and IM paths at each node
+          and computes EEPE on the net exposure. This is the method
+          recommended by CRE53 when the model explicitly simulates margining.
 
-        (1) RC benefit — Variation Margin received reduces current exposure.
-            The net current exposure after VM = max(V - VM - IM, TH + MTA - NICA, 0)
-            which mirrors the SA-CCR RC formula (CRE52.18).
+          EAD_csa = α × EEPE_margined
 
-        (2) MPOR benefit — Future exposure window is MPOR days not full maturity.
-            EEPE_mpor = EEPE_gross × √(MPOR / 250)
-            This is the regulatory approximation for uncollateralised models
-            per CRE53.22 (model does not explicitly simulate margining).
+        Tier 2 (fallback): CRE53.22 regulatory approximation.
+          Used when exposure_paths are not stored (memory-saving mode).
+          EEPE_mpor = EEPE_gross × √(MPOR / 250)
+          EAD_csa   = α × (RC_csa + EEPE_mpor)
 
-        Combined:
-            EAD_csa = α × (RC_csa + EEPE_mpor)
+        The tier is selected automatically based on whether exposure_paths
+        are available on the profile. A trace code is logged for audit.
+
+        Args:
+            profile:       ExposureProfile (must have exposure_paths for Tier 1)
+            netting_set:   NettingSet with CSA terms
 
         Returns:
-            (ead_csa, csa_reduction_pct, rc_csa, eepe_mpor, mpor_scale)
+            (ead_csa, csa_reduction_pct, rc_csa, eepe_margined, method_trace)
         """
         import math as _math
 
-        # ── Extract CSA terms from netting set ─────────────────────────────
+        # ── Extract CSA terms ─────────────────────────────────────────────────
         V    = sum(t.current_mtm for t in netting_set.trades) if netting_set.trades else profile.epe
         VM   = getattr(netting_set, "variation_margin", 0.0)
         IM   = getattr(netting_set, "initial_margin",   0.0)
         TH   = getattr(netting_set, "threshold",        0.0)
         MTA  = getattr(netting_set, "mta",              0.0)
         MPOR = getattr(netting_set, "mpor_days",       10)
-        NICA = IM   # net independent collateral amount (IM received)
+        HC   = getattr(netting_set, "haircut",          0.02)
+        NICA = IM
 
-        # ── (1) RC benefit — current exposure after VM ──────────────────────
-        # CRE52.18: RC = max(V - C, TH + MTA - NICA, 0)
-        # where C = VM + IM (total collateral received)
+        # ── RC benefit (current exposure) — same for both tiers ───────────────
+        # CRE52.18 / CRE53.23: RC_csa = max(V - C, TH + MTA - NICA, 0)
         C      = VM + IM
         rc_csa = max(V - C, TH + MTA - NICA, 0.0)
 
-        # ── (2) MPOR benefit — future exposure scaled to margin window ───────
-        # Per CRE53.22 (uncollateralised model approximation):
-        # EEPE_margined ≈ EEPE_gross × √(MPOR / 250)
-        # This captures that a daily-VM portfolio's future risk window
-        # is just the MPOR period, not the full trade maturity.
-        mpor_scale = _math.sqrt(MPOR / 250.0)
-        eepe_mpor  = profile.eepe * mpor_scale
+        # ══ TIER 1: Path-level margined EEPE (CRE53 preferred method) ════════
+        if profile.exposure_paths is not None:
+            method_trace = "CRE53-PATH-LEVEL"
 
-        # ── Combined CSA EAD ──────────────────────────────────────────────────
-        ead_csa = self.alpha * (rc_csa + eepe_mpor)
-        ead_csa = max(ead_csa, 0.0)
+            # Simulate VM paths (MPOR-lagged) and IM paths on stored paths
+            vm_paths = self._simulate_vm_paths(
+                profile.exposure_paths,
+                threshold=TH, mta=MTA, haircut=HC, mpor_days=MPOR,
+            )
+            im_paths = self._simulate_im_paths(
+                profile.exposure_paths, im_fixed=IM, im_fraction=0.0
+            )
 
-        # Percentage reduction vs gross EAD (profile.ead = α × EEPE_gross)
+            floor_term = max(TH + MTA - NICA, 0.0)
+            net_paths  = np.maximum(
+                profile.exposure_paths - vm_paths - im_paths, floor_term
+            )
+            net_paths  = np.maximum(net_paths, 0.0)
+
+            ee_m    = net_paths.mean(axis=0)
+            eee_m   = self._effective_ee(ee_m)
+            tg      = self._time_grid()
+            eepe_m  = self._eepe_one_year(eee_m, tg)   # Fix 2: 1yr window
+            ead_csa = self.alpha * eepe_m
+
+            # Store on profile for downstream use (CVA, attribution)
+            profile.margined_ee_profile = ee_m
+            profile.margined_eepe       = eepe_m
+            profile.margined_ead        = ead_csa
+
+            logger.info(
+                "CSA EAD [%s] %s: TH=%.0f MTA=%.0f IM=%.0f MPOR=%dd | "
+                "EEPE_gross=%.0f → EEPE_margined=%.0f | "
+                "EAD_gross=%.0f → EAD_csa=%.0f",
+                getattr(netting_set, "netting_id", "?"), method_trace,
+                TH, MTA, IM, MPOR,
+                profile.eepe, eepe_m,
+                profile.ead, ead_csa,
+            )
+
+        # ══ TIER 2: CRE53.22 approximation (fallback) ════════════════════════
+        else:
+            method_trace = "CRE53-APPROX-FALLBACK"
+            # Regulatory approximation: EEPE_margined ≈ EEPE_gross × √(MPOR/250)
+            mpor_scale = _math.sqrt(MPOR / 250.0)
+            eepe_m     = profile.eepe * mpor_scale
+            ead_csa    = self.alpha * (rc_csa + eepe_m)
+            ead_csa    = max(ead_csa, 0.0)
+
+            logger.warning(
+                "CSA EAD [%s] %s: exposure_paths not available — "
+                "using CRE53.22 approximation (EEPE_gross × √(MPOR/250)). "
+                "Store exposure_paths for path-level accuracy.",
+                getattr(netting_set, "netting_id", "?"), method_trace,
+            )
+
+        # ── Percentage reduction vs gross EAD ────────────────────────────────
         reduction_pct = (
             100.0 * (profile.ead - ead_csa) / profile.ead
             if profile.ead > 0 else 0.0
         )
 
         logger.info(
-            "CSA Regulatory EAD [%s]: "
-            "V=%.0f VM=%.0f IM=%.0f TH=%.0f MTA=%.0f | "
-            "RC_csa=%.0f  EEPE_gross=%.0f  MPOR_scale=%.3f  EEPE_mpor=%.0f | "
+            "CSA Regulatory EAD [%s] %s: "
+            "V=%.0f VM=%.0f IM=%.0f TH=%.0f MTA=%.0f HC=%.1f%% | "
+            "RC_csa=%.0f  EEPE_margined=%.0f | "
             "EAD_gross=%.0f → EAD_csa=%.0f  (−%.1f%%)",
-            getattr(netting_set, "netting_id", "?"),
-            V, VM, IM, TH, MTA,
-            rc_csa, profile.eepe, mpor_scale, eepe_mpor,
+            getattr(netting_set, "netting_id", "?"), method_trace,
+            V, VM, IM, TH, MTA, HC * 100,
+            rc_csa, eepe_m,
             profile.ead, ead_csa, reduction_pct,
         )
 
-        return ead_csa, reduction_pct, rc_csa, eepe_mpor, mpor_scale
+        return ead_csa, reduction_pct, rc_csa, eepe_m, method_trace
 
     def run_for_portfolio(
         self, trades: List[Trade], run_date: Optional[date] = None,
@@ -1597,14 +1869,17 @@ class IMMEngine:
         
         # ── CSA-adjusted EAD (regulatory, CRE53.22) ─────────────────────────────
         if netting_set is not None and getattr(netting_set, "has_csa", False):
-            ead_csa, csa_red, rc_csa, eepe_mpor, mpor_scale = (
+            ead_csa, csa_red, rc_csa, eepe_m, method_trace = (
                 self.compute_csa_ead_regulatory(profile, netting_set)
             )
             result["ead_imm_csa"]       = ead_csa
             result["csa_reduction_pct"] = round(csa_red, 2)
             result["rc_csa"]            = rc_csa
-            result["eepe_mpor"]         = eepe_mpor
-            result["mpor_scale"]        = round(mpor_scale, 4)
+            result["eepe_margined"]     = getattr(profile, "margined_eepe", 0.0)
+            result["ead_margined"]      = getattr(profile, "margined_ead",  ead_csa)
+            result["csa_method"]        = method_trace
+            result["eepe_mpor"]         = eepe_m
+            result["mpor_scale"]        = round(getattr(profile, "margined_eepe", eepe_m) / profile.eepe if profile.eepe > 0 else 0, 4)
             result["vm_received"]       = getattr(netting_set, "variation_margin", 0.0)
             result["im_posted"]         = getattr(netting_set, "initial_margin",   0.0)
         else:
@@ -1613,6 +1888,9 @@ class IMMEngine:
             result["rc_csa"]            = 0.0
             result["eepe_mpor"]         = result.get("eepe", 0.0)
             result["mpor_scale"]        = 1.0
+            result["eepe_margined"]     = 0.0
+            result["ead_margined"]      = result.get("ead_imm", 0.0)
+            result["csa_method"]        = "NO_CSA"
             result["vm_received"]       = 0.0
             result["im_posted"]         = 0.0
 

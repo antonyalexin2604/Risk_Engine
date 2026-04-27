@@ -20,6 +20,7 @@
 | 0.9 | January 2025 | Lead Developer | Review draft — submitted to stakeholders |
 | 1.0 | April 5, 2026 | Lead Developer | Final release |
 | 1.1 | April 27, 2026 | Lead Developer | Version 3.8 — Seven Basel III/IV regulatory rigour fixes + GFC stressed vol calibration |
+| 1.2 | April 27, 2026 | Lead Developer | Version 3.9 — CRE53 §margined EEPE: full path-level CSA collateral simulation |
 
 **Distribution List:**
 Chief Risk Officer · Head of Market Risk · Head of Credit Risk · Head of Treasury · Regulatory Affairs · IT Infrastructure · External Auditors (upon request)
