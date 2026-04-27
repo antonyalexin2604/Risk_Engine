@@ -1,6 +1,9 @@
 # FRTB Technical Guide
 ## Fundamental Review of the Trading Book (MAR10 / MAR21–23 / MAR31–33)
 ### PROMETHEUS Risk Platform
+**Last Updated:** Version 3.8 — Apr-27-2026  
+**Key Changes (v3.8):** Fix 5a — corrected liquidity horizon table (MAR33.12); Fix 5b — IMACapitalRegister 60-day rolling IMCC (MAR33.5)
+
 ---
 ## Table of Contents
 1. Overview & Regulatory Basis
@@ -101,13 +104,20 @@ tail_count = math.ceil(0.025 × n_scenarios)   ← FIX-05 (was int(), now ceil()
 ES = mean of the tail_count worst P&L observations
 ```
 For 250 scenarios: `ceil(0.025 × 250) = ceil(6.25) = 7` worst days averaged.
-**Liquidity Horizons:**
-| Asset Class | Horizon |
-|---|---|
-| Large-cap EQ, FX major | 10 days |
-| Small-cap EQ, FX other, IR major | 20 days |
-| HY credit spreads | 40 days |
-| Illiquid credit | 60 days |
+**Liquidity Horizons (Fix 5a — MAR33.12 Table 1, Version 3.8):**
+
+| Risk Class | Key | LH | Bucket | Version 3.8 Change |
+|---|---|---|---|---|
+| GIRR, FX major, large-cap EQ | `GIRR`, `FX`, `EQ_LARGE_CAP` | 10 days | j=1 | Unchanged |
+| Large-cap EQ (non-specified), liquid commodities | `EQ_LARGE`, `CMDTY_ENERGY` | 20 days | j=2 | Unchanged |
+| Small-cap EQ, other FX, other commodities | `EQ`, `FX_OTHER`, `CMDTY` | 40 days | j=3 | Unchanged |
+| **IG credit spread (non-sec, CTP)** | **`CSR_NS_IG`, `CSR_CTP_IG`** | **60 days** | j=4 | **New key added** |
+| **Non-IG credit spread, all securitisation** | **`CSR_NS`, `CSR_SEC`** | **120 days** | j=5 | **Was 40d / 60d — corrected** |
+
+`CSR_NS` corrected: **40 → 120 days** (non-IG credit is the j=5 bucket per MAR33.12).  
+`CSR_SEC` corrected: **60 → 120 days** (non-IG securitisation is j=5, not j=4).  
+`CSR_NS_IG` added at 60 days for investment-grade credit spread non-securitisation.  
+Unknown risk classes default conservatively to **120 days**.
 ### 4.2 Non-Modellable Risk Factors (NMRF — MAR31.14, FIX-07)
 Risk factors with < 24 price observations/year are NMRF. Capital = SSRM (Stressed Scenario Risk Measure) per factor, bank-estimated.
 **FIX-07:** Default of 0.0015 (15bp flat proxy) removed. No MAR31 basis. Callers must supply `factor_ssrm` explicitly.
@@ -124,8 +134,40 @@ Risk factors with < 24 price observations/year are NMRF. Capital = SSRM (Stresse
 | 10+ | Red | 2.00 (revert to SBM) |
 ---
 ## 5. Market Risk Capital
+
+### 5.1 IMA Capital Formula — 60-Day Rolling IMCC (Fix 5b, Version 3.8 / MAR33.5)
+
+MAR33.5 requires IMA capital to be the **maximum of today's ES and the 60-business-day average
+multiplied by the scaling factor mc**:
+
 ```
-IMA_capital = (k × ES + NMRF_charge) × 12.5
+IMCC_t = max(ES_today, mc_t × ES_60d_avg)
+```
+
+where `mc_t = 1.5 + backtesting_addon` (floor 1.5; amber-zone add-on per MAR32.9 table).
+
+**`IMACapitalRegister`** (new class in `backend/engines/frtb.py`, Version 3.8):
+- Maintains a 60-business-day rolling deque of daily ES values
+- `regulatory_imcc(es_today)` returns `max(ES_today, mc × avg_60d)` and the binding reason
+- `to_dict()` / `from_dict()` for PostgreSQL persistence across daily runs
+- `set_exceptions(n)` wires the amber-zone add-on from the backtesting module
+
+| Backtesting exceptions (12m) | Zone | Add-on | mc |
+|---|---|---|---|
+| 0–4 | Green | 0.00 | **1.50** |
+| 5 | Amber | 0.40 | 1.90 |
+| 6 | Amber | 0.50 | 2.00 |
+| 7 | Amber | 0.65 | 2.15 |
+| 8 | Amber | 0.75 | 2.25 |
+| 9 | Amber | 0.85 | 2.35 |
+| 10+ | Red | — | IMA disallowed |
+
+`FRTBEngine` now carries `self.ima_register = IMACapitalRegister()` initialised at startup.
+
+### 5.2 Overall Market Risk Capital
+
+```
+IMA_capital = (IMCC + NMRF_charge) × 12.5        ← IMCC replaces k × ES (Fix 5b)
 SBM_capital = SBM_total × 12.5
 Market Risk RWA = max(IMA_capital, SBM_capital)
 ```
@@ -145,6 +187,9 @@ Market Risk RWA = max(IMA_capital, SBM_capital)
 | FIX-10 | LOW | Correlation config in try/finally |
 | FIX-11 | LOW | GIRR inter-bucket scalar limitation documented |
 | FIX-12 | LOW | Commodity bucket assignment documented |
+| **FIX-5a** | **HIGH** | **CSR_NS LH corrected 40→120d; CSR_SEC 60→120d; CSR_NS_IG added @60d (MAR33.12 Table 1)** |
+| **FIX-5b** | **MEDIUM** | **IMACapitalRegister: 60-day rolling IMCC = max(ES_today, mc×ES_avg); mc floor 1.5 (MAR33.5)** |
+
 ---
 ## 7. Glossary
 | Term | Definition |

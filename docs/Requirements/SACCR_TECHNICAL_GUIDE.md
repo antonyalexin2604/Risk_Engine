@@ -1,6 +1,8 @@
 # SA-CCR Technical Guide
 ## Standardised Approach for Counterparty Credit Risk (CRE52)
 ### PROMETHEUS Risk Platform
+**Last Updated:** Version 3.8 — Apr-27-2026  
+**Key Changes (v3.8):** Fix 4 — Output floor base now uses SA-CCR for CCR component (RBC20.11); SA-CCR is the mandatory parallel run even when IMM is the primary approach.
 
 ---
 

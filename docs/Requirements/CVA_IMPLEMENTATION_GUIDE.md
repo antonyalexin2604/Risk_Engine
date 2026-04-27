@@ -11,8 +11,9 @@ The PROMETHEUS CVA engine has been designed with a comprehensive framework for f
 1. **SA-CVA Architecture** - Full 6 delta + 5 vega risk class framework
 2. **BA-CVA Implementation** - Complete basic approach with hedge recognition
 3. **Proxy Spread Calibration** - Monthly review workflow infrastructure
-4. **Capital Floor Verification** - CVA exclusion from output floor confirmed
+4. **Capital Floor Verification** - CVA exclusion from output floor confirmed (CAP10 FAQ1)
 5. **Operational Risk Dashboard** - SMA (OPE25) integrated into main dashboard
+6. **BA-CVA DF=1 for IMM Banks (Version 3.8)** - MAR50.15(4) — `imm_bank=True` flag in `compute_ba_cva()`
 
 ### 🔧 IN PROGRESS (Framework Exists, Needs Integration)
 

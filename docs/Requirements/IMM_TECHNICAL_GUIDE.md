@@ -1,9 +1,10 @@
 # PROMETHEUS — Internal Models Method (IMM)
 ## Technical Reference: EPE, EEPE & All Functional Terms
 
-**Regulatory Basis:** Basel III CRE53 (effective January 2023)  
+**Regulatory Basis:** Basel III CRE53 / CRE51.15 (effective January 2023)  
 **Engine File:** `backend/engines/imm.py`  
-**Prepared:** April 2026
+**Prepared:** April 2026 | **Last Updated:** Version 3.8 — Apr-27-2026  
+**Key Changes (v3.8):** Fix 1 — dual-run max(current, stressed) EAD (CRE51.15); Fix 2 — EEPE 1yr window (CRE53); Fix B — per-asset-class GFC empirical stressed vols replacing 2× shortcut
 
 ---
 
@@ -457,30 +458,47 @@ The matrix is validated to be **symmetric positive-definite** (all eigenvalues >
 
 CRE53.17 requires banks to run a **parallel simulation using parameters calibrated to the most stressful one-year period** in the observation window — typically the 2007–2009 global financial crisis.
 
-### 7.2 Stressed Parameters
+### 7.2 Stressed Parameters — GFC Empirical Calibration (Version 3.8)
 
-| Parameter | Base | Stressed | Ratio |
-|---|---|---|---|
-| Equity vol (σ) | 20% | **40%** | 2× |
-| IR vol (σᵣ) | 1.5% | **3.0%** | 2× |
-| FX vol | 20% | **40%** | 2× |
-| Correlation matrix | Base | Base (unchanged) | — |
+Per-asset-class GFC stressed volatilities replace the prior single `stressed_vol = 2 × base` shortcut.
+Parameters are sourced from realised market data for the 2007–09 crisis period and enforced as
+regulatory floors in `calibration.py → apply_to_imm()` so that no rolling recalibration can reduce
+them below the observed GFC levels.
+
+| Asset Class | Parameter | Base | **Stressed (GFC Floor)** | Old (2× Shortcut) | Empirical Source |
+|---|---|---|---|---|---|
+| Equity | `stressed_vol` | 20% | **38%** | 40% | S&P 500 realised vol 2007–09; CBOE VIX avg ~32% |
+| Interest Rate | `ir_stressed_vol` | 1.5% | **≥ 2.0%** | 3.0% | 10Y UST absolute rate σ 2007–09 (~120–200bp/yr) |
+| FX | `fx_stressed_vol` | 10% | **18%** | 20% | EURUSD realised vol 2007–09 (~15–18% annual) |
+| Credit Spread | `cr_stressed_vol` | 30% | **65%** | 60% | IG CDX log-vol 2007–09 (spread 70bp→280bp) |
+| Commodity | `cmdty_stressed_vol` | 25% | **58%** | 50% | WTI realised vol 2007–09 (oil $147→$35) |
+| Correlation matrix | — | Base | Base (unchanged) | — | — |
 
 The stressed calibration window is: **1 January 2007 — 31 December 2009**
+
+**Calibration pipeline protection (Version 3.8):** `apply_to_imm()` in `backend/data_sources/calibration.py`
+now enforces: `stressed_vol = max(rolling_calibration, 1.5 × base, GFC_floor)`. This prevents the
+rolling 1-year lookback window (which cannot span the GFC) from silently overriding the empirical floors.
 
 ### 7.3 Stressed EAD Calculation
 
 ```
-Stressed EEPE = average(Stressed EEE) over [0, 1yr]
+Stressed EEPE = time-weighted average(Stressed EEE) over [0, 1yr]   ← Fix 2: 1yr window
 Stressed EAD  = α × Stressed EEPE
 ```
 
-### 7.4 Capital Floor
+### 7.4 Regulatory Capital Floor — Dual-Run max() (Version 3.8 / CRE51.15)
 
-The regulatory capital charge uses the **higher** of the base and stressed metrics in practice:
+CRE51.15 requires that the regulatory EAD is the **maximum** of the current and stressed calibrations:
+
+```python
+# backend/engines/imm.py — compute_rwa()
+ead_regulatory = max(profile.ead, profile.stressed_ead)   # Fix 1 (CRE51.15)
+RWA_IMM = ead_regulatory × risk_weight × 12.5 × 0.08
 ```
-Capital EAD = max(Base EAD, Stressed EAD)
-```
+
+`run_for_portfolio()` now returns `ead_regulatory` and `stressed_binding` keys to expose which
+run drove the capital charge on each execution date.
 
 This prevents banks from gaming the system by calibrating to a benign recent period.
 
@@ -770,13 +788,22 @@ RWA = Capital Charge / 8%
 
 The factor 12.5 = 1 / 8% converts from capital to RWA (since minimum capital = 8% of RWA under Basel III Pillar 1).
 
-For CCR:
-```
-RWA_IMM = EAD_IMM × RW × 12.5 × 0.08
-         = EAD_IMM × RW
+For CCR — **Version 3.8 (CRE51.15 compliant)**:
+```python
+# Fix 1: dual-run max enforced in compute_rwa()
+ead_regulatory = max(profile.ead, profile.stressed_ead)
+RWA_IMM = ead_regulatory × RW × 12.5 × 0.08
+         = ead_regulatory × RW
 ```
 
 The `risk_weight` parameter defaults to 1.0 (100% risk weight for unrated / standardised).
+
+| Key | Source | Notes |
+|---|---|---|
+| `ead_imm` | α × EEPE_current | Current-calibration EAD |
+| `stressed_ead` | α × EEPE_stressed | GFC-calibrated stressed EAD |
+| `ead_regulatory` | `max(ead_imm, stressed_ead)` | **Regulatory binding EAD (Fix 1)** |
+| `stressed_binding` | bool | `True` when stressed run drives capital |
 
 ---
 
@@ -791,6 +818,11 @@ Defined in `backend/config.py`:
 | `time_horizon_years` | `IMM` | 1.0 | Simulation horizon |
 | `random_seed` | `IMM` | Fixed | Reproducibility seed |
 | `alpha` | `SACCR` | **1.4** | Regulatory EAD multiplier |
+| `stressed_vol` | `MarketParams` | **0.38** | EQ GFC stressed vol (2007–09 empirical; was 0.40) |
+| `ir_stressed_vol` | `MarketParams` | **≥ 0.020** | IR GFC floor σᵣ (2007–09 empirical; was 0.030) |
+| `fx_stressed_vol` | `MarketParams` | **0.18** | FX GFC stressed vol (2007–09 empirical; was 0.20) |
+| `cr_stressed_vol` | `MarketParams` | **0.65** | CR GFC stressed vol (IG CDX 2007–09; was 0.60) |
+| `cmdty_stressed_vol` | `MarketParams` | **0.58** | CMDTY GFC stressed vol (WTI 2007–09; was 0.50) |
 
 ---
 

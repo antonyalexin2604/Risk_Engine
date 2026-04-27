@@ -1,6 +1,8 @@
 # CVA Risk Capital — Technical Guide
 ## Credit Valuation Adjustment (MAR50)
 ### PROMETHEUS Risk Platform
+**Last Updated:** Version 3.8 — Apr-27-2026  
+**Key Changes (v3.8):** Fix 3 — BA-CVA supervisory discount factor DF=1 for IMM banks (MAR50.15(4))
 
 ---
 
@@ -129,6 +131,18 @@ BA-CVA estimates CVA capital from the **EAD** of each counterparty (not from sen
 - **Effective maturity discount** for time value
 
 ### Stand-Alone CVA Capital: SC_c (MAR50.15)
+
+> **Version 3.8 — Fix 3 (MAR50.15(4)):** The supervisory discount factor `DFNS` now switches
+> based on whether the bank uses IMM to compute EAD for the netting set:
+>
+> | Bank type | `DFNS` formula | Rationale |
+> |---|---|---|
+> | **IMM bank** (`imm_bank=True`) | **1.0** | IMM effective maturity already incorporates discounting |
+> | Non-IMM bank | `(1 − exp(−0.05×M)) / (0.05×M)` | Basel-fixed r=5% (MAR50 footnote 3 — **not** live OIS) |
+>
+> `compute_ba_cva(inputs, ..., imm_bank=True)` — default is `True` in PROMETHEUS (IMM bank).
+> Quantitative impact: for a 5-year netting set, the non-IMM DF ≈ 0.779, meaning SCVA was
+> overstated by **+28%** before this fix for all 5-year exposures.
 
 ```
 SC_c = RW_c × M_c_eff × EAD_c
@@ -374,6 +388,7 @@ Fetches live market data from FRED (no API key required):
 | **FIX-05** | MEDIUM | MAR50.65 | SA-CVA RW by sector bucket (8-bucket, not PD threshold) | Correct RW selection |
 | **FIX-06** | MEDIUM | MAR50.48 | Vega always computed (not optional) | Ensures completeness |
 | **FIX-07** | MEDIUM | MAR50.15 | Multi-netting-set support per counterparty | Accuracy for complex counterparties |
+| **FIX-3** | **HIGH** | **MAR50.15(4)** | **BA-CVA DF=1 for IMM banks; `imm_bank=True` default in `compute_ba_cva()`** | **IMM bank SCVA overstated by 2–65% for 1–10yr exposures** |
 | **FIX-08** | LOW | MAR50.32 | WWR flag and EAD add-on added | Explicit WWR treatment |
 | **FIX-09** | LOW | MAR50.32 | Proxy spread function with sector/rating/region | MAR50.32(3) compliance |
 

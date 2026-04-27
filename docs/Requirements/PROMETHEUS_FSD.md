@@ -19,6 +19,7 @@
 | 0.5 | December 2024 | Lead Developer | Completed FR sections, architecture |
 | 0.9 | January 2025 | Lead Developer | Review draft — submitted to stakeholders |
 | 1.0 | April 5, 2026 | Lead Developer | Final release |
+| 1.1 | April 27, 2026 | Lead Developer | Version 3.8 — Seven Basel III/IV regulatory rigour fixes + GFC stressed vol calibration |
 
 **Distribution List:**
 Chief Risk Officer · Head of Market Risk · Head of Credit Risk · Head of Treasury · Regulatory Affairs · IT Infrastructure · External Auditors (upon request)
@@ -129,6 +130,9 @@ Sprint A is complete as of January 2025. The platform has achieved:
 
 - Implement the complete **five-part RWA formula** (RBC20.9): Credit + CCR + Market + CVA + CCP + OpRisk
 - Implement the **output floor** (RBC20.11): Final RWA = max(Total RWA, 72.5% × SA-based RWA)
+  - **Version 3.8 (Fix 4):** Floor base uses SA-CCR for CCR and FRTB SBM for market risk — not IMM/IMA.
+    CVA RWA explicitly excluded from floor base per CAP10 FAQ1. `rwa_floor_base_sa` exposed in
+    `capital_summary` dict for audit trail.
 - Provide **fallback logic** with full trace codes when IMM trades revert to SA-CCR or SA-CVA reverts to BA-CVA
 - Enable **real-time market condition adjustments** to risk weights and correlations via pluggable market data feeds
 - Deliver a **Streamlit-based interactive dashboard** for risk officers, with downloadable regulatory reports
@@ -155,6 +159,7 @@ Sprint A is complete as of January 2025. The platform has achieved:
 | **CDS Spread Service** | `backend/data_sources/cds_spread_service.py` | Data Source | Supporting |
 | **Market State** | `backend/data_sources/market_state.py` | Data Source | Supporting |
 | **Calibration Module** | `backend/data_sources/calibration.py` | Data Source | Supporting |
+| **G-SIB Capital Module** | `backend/engines/gsib_capital.py` | Capital Engine | Supporting — v3.8 |
 | **Persistence Module** | `backend/data_sources/persistence.py` | Data Persistence | Supporting |
 | **Streamlit Dashboard** | `dashboard/app.py` | Presentation Layer | User-Facing |
 | **Test Suite** | `tests/test_engines.py` | Quality Assurance | Validation |

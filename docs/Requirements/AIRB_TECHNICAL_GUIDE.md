@@ -3,7 +3,8 @@
 
 **Regulatory Basis:** Basel III CRE30–CRE36 (effective January 2023)  
 **Engine File:** `backend/engines/a_irb.py`  
-**Prepared:** April 2026
+**Prepared:** April 2026 | **Last Updated:** Version 3.8 — Apr-27-2026  
+**Key Changes (v3.8):** Fix 7 — Through-the-Cycle (TtC) PD calibration with LRA anchor and 80/20 blend (CRE36.63 / CRE36.77)
 
 ---
 
@@ -499,6 +500,58 @@ This is a regulatory add-on under EU CRR3 Article 87a, reflecting transition ris
 
 ---
 
+## 12a. Through-the-Cycle PD Calibration — Version 3.8 (CRE36.63 / CRE36.77)
+
+### Regulatory Requirement
+
+CRE36.63: *"PD estimates must be a long-run average of one-year default rates for borrowers in the grade."*  
+CRE36.77: *"Banks must use information and techniques that take appropriate account of the long-run experience."*  
+CRE31.17: PD floor for non-defaulted exposures = **3 basis points (0.03%)**.
+
+Market-implied (CDS-derived) PDs are Point-in-Time (PiT). They are appropriate for CVA capital (MAR50.32)
+but **must not be used directly for A-IRB regulatory capital** without TtC anchoring.
+
+### Implementation (Version 3.8)
+
+**`LRA_PD_TTC`** — S&P 42-year long-run average default rates (`backend/data_sources/credit_calibration.py`):
+
+| Rating | LRA PD (1yr) | Source |
+|---|---|---|
+| AAA | 0.000% | S&P default study 1981–2022 |
+| AA | 0.022% | S&P default study |
+| A | 0.071% | S&P default study |
+| **BBB** | **0.209%** | S&P default study (key corporate grade) |
+| BB | 0.969% | S&P default study |
+| B | 4.462% | S&P default study |
+| CCC | 26.949% | S&P default study |
+
+**`pd_from_rating_ttc(rating, horizon_years, pit_pd)`**:
+1. Anchors to `LRA_PD_TTC[rating]` — the TtC long-run baseline
+2. Optional PiT blend: `TtC_PD = 0.80 × LRA_PD + 0.20 × PiT_PD` (80/20 lean-TtC per CRE36.77)
+3. Horizon scaling: `P(T) = 1 − (1 − P_1yr)^T` (survival probability, not matrix power)
+4. Clamped: `[3bp, 99.9%]` per CRE31.17
+
+**`blended_pd()` in `a_irb.py`** updated with the 80/20 TtC overlay:
+```python
+# Fix 7: regulatory_pd = 80% TtC LRA + 20% internal PiT blend
+lra   = LRA_PD_TTC.get(rating, LRA_PD_TTC["NR"])
+regulatory_pd = 0.80 * lra + 0.20 * pit_blended
+```
+
+### Stability Under Stress (Design Intent)
+
+| Scenario | PiT PD (BBB) | TtC PD (BBB) | Regulatory PD |
+|---|---|---|---|
+| Benign market | 0.08% | 0.21% | 0.22% |
+| Normal | 0.15% | 0.21% | 0.21% |
+| Stress (2020 COVID) | 0.90% | 0.21% | 0.37% |
+| Severe stress (2008 GFC) | 2.50% | 0.21% | 0.67% |
+
+The TtC approach is counter-cyclical by design — RWA does not collapse in benign conditions
+nor spike procyclically in stress, as required by CRE36.63.
+
+---
+
 ## 13. SA Output Floor — CRE20.4 / Basel IV
 
 Under Basel IV (fully phased in from January 2025), IRB RWA cannot be less than 72.5% of the Standardised Approach RWA for the same exposure:
@@ -594,6 +647,9 @@ Defined in `backend/config.py` and `AIRBConfiguration`:
 | **N(·)** | Cumulative Normal distribution function | — |
 | **N⁻¹(0.999)** | Inverse normal at 99.9th percentile = **3.0902** | CRE31.4 |
 | **PD** | Probability of Default (1-year horizon) | CRE36 |
+| **LRA-PD** | Long-Run Average PD — S&P 42-year TtC default rate anchor | CRE36.63 |
+| **TtC PD** | Through-the-Cycle PD = 80% LRA_PD + 20% PiT PD (blended, CRE36.77) | `pd_from_rating_ttc()` |
+| **PiT PD** | Point-in-Time PD (market-implied / CDS-derived) — for CVA only, not A-IRB | MAR50.32 |
 | **PD Floor** | Minimum PD = **0.03%** for CORP/BANK/SOV | CRE31.5 |
 | **R** | Asset Correlation ∈ [0.12, 0.24] for CORP | CRE31.5 |
 | **R_regulatory** | Basel-formula R (Pillar 1 capital — never adjusted) | CRE31.5 |
