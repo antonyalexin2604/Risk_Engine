@@ -161,9 +161,9 @@ def create_derivative_portfolio(
     mta = rng.choice([100_000, 250_000])
 
     # Initial Margin placeholder — will be recalculated after trades are known
-    # Rough estimate: 3-5% of expected gross notional for the netting set
+    # Per user specification: IM = 2% of gross notional (realistic bilateral ISDA SIMM)
     approx_notional = 50_000_000  # placeholder before trades are known
-    initial_margin  = approx_notional * rng.uniform(0.03, 0.05)
+    initial_margin  = approx_notional * 0.02  # 2% placeholder (updated post-build)
 
     netting = NettingSet(
         netting_id       = netting_id,
@@ -372,14 +372,18 @@ def create_derivative_portfolio(
     vm_received = max(net_mtm - threshold, 0.0)
     netting.variation_margin = vm_received
 
-    # IM = 3% of gross notional (bilateral ISDA SIMM approximation)
-    netting.initial_margin = gross_notional * 0.03
+    # IM = 2% of gross notional (user specification)
+    # Reflects a realistic bilateral IM for a liquid, well-rated OTC portfolio.
+    # Source: config.CSA.im_pct_notional = 0.02
+    netting.initial_margin = gross_notional * 0.02
 
-    logger.debug(
-        "Portfolio %s CSA: net_mtm=%.0f TH=%.0f VM_received=%.0f IM=%.0f "
-        "→ RC_floor=max(%.0f, %.0f)",
+    logger.info(
+        "Portfolio %s CSA: net_mtm=%.0f TH=%.0f MTA=%.0f "
+        "VM=%.0f IM=%.0f (2%% notional=%.0f) "
+        "RC_floor=max(%.0f, %.0f)",
         portfolio_id,
-        net_mtm, threshold, vm_received, netting.initial_margin,
+        net_mtm, threshold, mta,
+        vm_received, netting.initial_margin, gross_notional,
         net_mtm - vm_received - netting.initial_margin,
         threshold + mta - netting.initial_margin,
     )

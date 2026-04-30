@@ -116,3 +116,16 @@ CORP_RISK_WEIGHTS = {
     "CCC": 1.50,
     "NR":  1.00,
 }
+
+
+# ── CSA parameters (user specification) ─────────────────────────────────────
+class CSA:
+    im_pct_notional: float = 0.02   # Initial Margin = 2% of gross notional
+    threshold:       float = 10_000  # TH = $10,000
+    mta:             float = 5_000   # MTA = $5,000
+    call_freq_days:  int   = 1        # Daily margin calls
+    settlement_lag_days: int = 1      # T+1 settlement
+    haircut:         float = 0.02    # 2% collateral haircut
+    MPOR_BILATERAL:  int   = 10
+    MPOR_CLEARED:    int   = 5
+    MPOR_LARGE_ILLIQUID: int = 20
