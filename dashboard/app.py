@@ -817,8 +817,14 @@ elif page == "Derivative Portfolios":
     ead_csa   = imm.get("ead_imm_csa", ead_gross)
     csa_red   = imm.get("csa_reduction_pct", 0)
     kpi(c3,"IMM EAD (Gross)", fmt_bn(ead_gross),                       "Before CSA benefit",   "CRE53 uncoll.", "t-stone")
-    kpi(c4,"IMM EAD (CSA)",   fmt_bn(ead_csa),                         "After CSA: VM+IM+MPOR","CRE53.22",      "t-ok" if csa_red>10 else "t-stone")
-    kpi(c5,"CCR RWA",         fmt_bn(port["rwa_ccr"]),                 "Credit RWA (CCR)",     "CRE51.13",      "t-blue")
+    csa_method_label = imm.get("csa_method", "CRE53.22") if imm else "CRE53.22"
+    kpi(c4,"IMM EAD (CSA)",   fmt_bn(ead_csa), "After CSA: VM+IM+MPOR", csa_method_label, "t-ok" if csa_red>10 else "t-stone")
+    ead_method_label = port.get("ead_method","SA-CCR")
+    ccr_rwa_sub = ("IMM EAD active" if ead_method_label=="IMM"
+                   else "CRE53.5 floor" if "FLOOR" in ead_method_label
+                   else "SA-CCR fallback")
+    kpi(c5,"CCR RWA", fmt_bn(port["rwa_ccr"]),
+        ccr_rwa_sub, ead_method_label, "t-ok" if ead_method_label=="IMM" else "t-blue")
 
     sec("SA-CCR ADD-ON BY ASSET CLASS")
     addons={"Interest Rate":port["saccr"]["addon_ir"],"FX":port["saccr"]["addon_fx"],
@@ -838,7 +844,8 @@ elif page == "Derivative Portfolios":
         im_p  = imm.get("im_posted",    0)
         rc_c  = imm.get("rc_csa",       0)
         mpor_s= imm.get("mpor_scale",   1.0)
-        sec("CSA BENEFIT DECOMPOSITION — CRE53.22")
+        csa_sec_label = imm.get("csa_method","CRE53.22") if imm else "CRE53.22"
+        sec(f"CSA BENEFIT DECOMPOSITION — {csa_sec_label}")
         cb1,cb2,cb3,cb4 = st.columns(4)
         kpi(cb1,"VM Received",    fmt_bn(vm_r),          "Variation Margin",      "Daily call",       "t-ok")
         kpi(cb2,"IM Posted",      fmt_bn(im_p),          "Initial Margin (SIMM)", "Segregated",        "t-ok")

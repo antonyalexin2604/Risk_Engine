@@ -1474,50 +1474,63 @@ class IMMEngine:
         mta: float,
         haircut: float,
         mpor_days: int,
+        call_freq_days:      int = 1,
+        settlement_lag_days: int = 1,
     ) -> np.ndarray:
         """
         Simulate Variation Margin (VM) account paths at each MC node.
 
-        CRE53 §margined EEPE requires that when a model explicitly simulates
-        margining, the VM at each node is the collateral actually held —
-        posted at the **prior** margin call date (MPOR days ago), not today.
-        This lag captures the exposure that accrues during the re-margining
-        period before new collateral arrives.
+        CRITICAL DISTINCTION — three separate concepts:
 
-        Algorithm:
-          At each time node t:
-            1. The margin call is raised when exposure > threshold + MTA.
-               Call amount = max(0, exposure[t] - threshold).
-            2. Collateral actually received = the call raised MPOR nodes ago
-               (because it takes MPOR business days to collect).
-            3. VM_received[t] = call raised at (t - lag) nodes ago, 0 if t < lag.
-            4. The net haircut-adjusted VM value = (1 - haircut) × VM_received.
+        (1) call_freq_days (DEFAULT 1 = daily):
+            How often VM is called in normal CSA operations.
+            Standard bilateral ISDA CSA = 1 business day (daily).
+
+        (2) settlement_lag_days (DEFAULT 1 = T+1):
+            Days from the call being raised to cash actually arriving.
+            Standard = T+1 (next business day settlement).
+
+        (3) mpor_days — NOT used here as VM lag:
+            MPOR is a DEFAULT SCENARIO regulatory construct (CRE52/CRE53).
+            It represents close-out days after counterparty default.
+            It is used in SA-CCR MF = sqrt(MPOR/250) and the regulatory
+            EAD cap — NOT as the operational VM delivery lag.
+
+        Operational VM lag = call_freq_days + settlement_lag_days.
+        For a standard daily-call CSA with T+1 settlement: lag = 2 business days.
 
         Args:
-            exposure_paths: shape (N, T) — gross MC exposure at each node
-            threshold:      minimum exposure before VM is called (TH, USD)
-            mta:            minimum transfer amount (USD)
-            haircut:        collateral haircut (e.g. 0.02 = 2%)
-            mpor_days:      margin period of risk in business days
+            exposure_paths:      shape (N, T) gross MC exposure
+            threshold:           minimum exposure before VM called (USD)
+            mta:                 minimum transfer amount (USD)
+            haircut:             collateral haircut (e.g. 0.02)
+            mpor_days:           REGULATORY ONLY — not used as VM lag
+            call_freq_days:      how often VM is called (1 = daily)
+            settlement_lag_days: T+N settlement delay (1 = T+1)
 
         Returns:
-            vm_paths: shape (N, T) — haircut-adjusted VM value at each node
+            vm_paths: shape (N, T) — haircut-adjusted VM held at each node
         """
         N, T = exposure_paths.shape
-        # MPOR expressed as simulation time-steps
-        # dt = time_horizon_years / T; 1 business day ≈ 1/250 years
-        dt_years     = IMM.time_horizon_years / T
+        dt_years      = IMM.time_horizon_years / T
         steps_per_day = max(1.0, 1.0 / (dt_years * 250.0))
-        lag_steps    = max(1, int(round(mpor_days * steps_per_day)))
 
-        # VM call raised when exposure > TH + MTA
-        call_amount   = np.maximum(0.0, exposure_paths - threshold - mta)   # (N, T)
-        vm_received   = np.zeros_like(call_amount)                           # (N, T)
+        # Operational lag = call frequency + settlement delay (NOT MPOR)
+        operational_lag_days = call_freq_days + settlement_lag_days
+        lag_steps = max(1, int(round(operational_lag_days * steps_per_day)))
+
+        # VM call raised on the call_freq grid, not every step
+        call_freq_steps = max(1, int(round(call_freq_days * steps_per_day)))
+        call_amount = np.zeros_like(exposure_paths)
+        for t in range(0, T, call_freq_steps):
+            call_amount[:, t] = np.maximum(0.0, exposure_paths[:, t] - threshold - mta)
+
+        # VM received = call raised lag_steps ago
+        vm_received = np.zeros_like(call_amount)
         if lag_steps < T:
             vm_received[:, lag_steps:] = call_amount[:, :T - lag_steps]
-        # else: all collateral arrives after simulation horizon → 0
 
-        vm_paths = (1.0 - haircut) * vm_received    # haircut-adjusted value
+        vm_paths = (1.0 - haircut) * vm_received
         return vm_paths
 
     def _simulate_im_paths(
@@ -1617,9 +1630,13 @@ class IMMEngine:
         )
         # exposure_paths: shape (N_eff, T) — gross positive MtM at each node
 
-        # ── Simulate VM paths — MPOR-lagged collateral (CRE53.14) ────────────
+        # ── Simulate VM paths — operational lag (call_freq + settlement) ───────
+        # MPOR is regulatory only; operational lag drives normal-life VM delivery
+        _call_freq  = int(getattr(netting_set, "call_freq_days",      1))
+        _settle_lag = int(getattr(netting_set, "settlement_lag_days", 1))
         vm_paths = self._simulate_vm_paths(
-            exposure_paths, threshold=TH, mta=MTA, haircut=HC, mpor_days=MPOR
+            exposure_paths, threshold=TH, mta=MTA, haircut=HC, mpor_days=MPOR,
+            call_freq_days=_call_freq, settlement_lag_days=_settle_lag,
         )
 
         # ── Simulate IM paths — fixed + dynamic (CRE53.23) ───────────────────
@@ -1731,10 +1748,12 @@ class IMMEngine:
         if profile.exposure_paths is not None:
             method_trace = "CRE53-PATH-LEVEL"
 
-            # Simulate VM paths (MPOR-lagged) and IM paths on stored paths
+            # Tier 1 (CRE53-PATH-LEVEL): VM uses operational lag, NOT MPOR
             vm_paths = self._simulate_vm_paths(
                 profile.exposure_paths,
                 threshold=TH, mta=MTA, haircut=HC, mpor_days=MPOR,
+                call_freq_days      = int(getattr(netting_set, "call_freq_days",      1)),
+                settlement_lag_days = int(getattr(netting_set, "settlement_lag_days", 1)),
             )
             im_paths = self._simulate_im_paths(
                 profile.exposure_paths, im_fixed=IM, im_fraction=0.0

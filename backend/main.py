@@ -121,17 +121,64 @@ class PrometheusRunner:
             if imm_trades:
                 imm_res = self.imm.run_for_portfolio(imm_trades, run_date, netting_set=netting)
 
-            ead_ccr = saccr_res.ead
-            # Use CSA-adjusted EAD for floor check (CRE53.5)
-            if imm_res and imm_res["ead_imm_csa"] < saccr_res.ead * 0.5:
-                logger.warning("Portfolio %s: IMM below SA-CCR floor — floor applied", pid)
-                for t in imm_trades:
-                    if t.saccr_method == "IMM":
-                        t.saccr_method   = "FALLBACK"
-                        t.fallback_trace = f"FALLBACK|{t.trade_id}|REGULATORY_FLOOR|CRE53.5"
+            # ── CRE51.12 / CRE53.5: select EAD for RWA ──────────────────────────
+            # IMM-approved banks MUST use IMM EAD for capital — that is the
+            # entire regulatory purpose of obtaining IMM approval.
+            # The bank loses the modelled EAD benefit if SA-CCR is always used.
+            #
+            # CRE53.5 floor: EAD_IMM cannot fall below the current RC of the
+            # netting set.  Simplified here as 50% × SA-CCR EAD (consistent
+            # with existing floor-check logic above).
+            #
+            # Routing:
+            #   IMM available, EAD_IMM ≥ floor  → use EAD_IMM   (IMM benefit)
+            #   IMM available, EAD_IMM < floor   → use floor     (CRE53.5 applied)
+            #   No IMM / fallback                → use SA-CCR    (standardised)
 
-            port_rwa_ccr  = ead_ccr * 1.0 * 12.5 * 0.08
-            rwa_ccr      += port_rwa_ccr
+            saccr_ead_standalone = saccr_res.ead   # preserved for output floor (Fix 4)
+            cre53_5_floor        = saccr_ead_standalone * 0.50
+
+            imm_fallback = False
+            if imm_res:
+                imm_ead_csa = imm_res.get("ead_imm_csa", 0.0)
+                if imm_ead_csa >= cre53_5_floor:
+                    # IMM EAD above floor — use it (full IMM capital benefit)
+                    ead_ccr     = imm_ead_csa
+                    ead_method  = "IMM"
+                    logger.info(
+                        "CCR EAD [%s] IMM active: EAD_IMM=%.0f  SA-CCR=%.0f  "
+                        "saving %.1f%%  (CRE53.5 floor=%.0f OK)",
+                        pid, imm_ead_csa, saccr_ead_standalone,
+                        (saccr_ead_standalone - imm_ead_csa) / saccr_ead_standalone * 100
+                        if saccr_ead_standalone > 0 else 0.0,
+                        cre53_5_floor,
+                    )
+                else:
+                    # IMM EAD below floor — apply CRE53.5 floor (not full SA-CCR)
+                    ead_ccr    = cre53_5_floor
+                    ead_method = "IMM_FLOOR_CRE53.5"
+                    imm_fallback = True
+                    logger.warning(
+                        "CCR EAD [%s] CRE53.5 floor: IMM=%.0f < floor=%.0f → "
+                        "using floor (saving %.1f%% vs full SA-CCR=%.0f)",
+                        pid, imm_ead_csa, cre53_5_floor,
+                        (saccr_ead_standalone - cre53_5_floor) / saccr_ead_standalone * 100
+                        if saccr_ead_standalone > 0 else 0.0,
+                        saccr_ead_standalone,
+                    )
+                    for t in imm_trades:
+                        if t.saccr_method == "IMM":
+                            t.fallback_trace = (
+                                f"FLOOR|{t.trade_id}|CRE53.5|"
+                                f"IMM={imm_ead_csa:.0f}<floor={cre53_5_floor:.0f}"
+                            )
+            else:
+                # No IMM result — SA-CCR is the only method
+                ead_ccr    = saccr_ead_standalone
+                ead_method = "SA-CCR"
+
+            port_rwa_ccr = ead_ccr * 1.0 * 12.5 * 0.08
+            rwa_ccr     += port_rwa_ccr
 
             sensitivities = self._generate_sensitivities(pid, trades)
             pnl_series    = np.random.default_rng(42).normal(0, 50_000, 250)
@@ -162,6 +209,11 @@ class PrometheusRunner:
                 "imm": imm_res,
                 "ead_imm_csa": imm_res.get("ead_imm_csa", 0) if imm_res else 0,
                 "csa_reduction_pct": imm_res.get("csa_reduction_pct", 0) if imm_res else 0,
+                "ead_for_rwa":    ead_ccr,            # EAD used for CCR RWA
+                "ead_saccr":      saccr_ead_standalone, # SA-CCR EAD (for reference)
+                "ead_method":     ead_method,          # "IMM"|"IMM_FLOOR_CRE53.5"|"SA-CCR"
+                "cre53_5_floor":  cre53_5_floor,       # 50% × SA-CCR floor
+
                 "frtb": {
                     "sbm_total": frtb_res.sbm_total, "sbm_delta": frtb_res.sbm_delta,
                     "sbm_vega": frtb_res.sbm_vega, "sbm_curvature": frtb_res.sbm_curvature,
@@ -268,8 +320,13 @@ class PrometheusRunner:
         # SA-CCR RWA already available from the SA-CCR engine run
         # FRTB SBM capital is the standardised floor component
         # CVA RWA is explicitly excluded from the floor base (CAP10 FAQ1)
-        # Fix 4: SA-CCR proxy (rwa_ccr is already SA-CCR based; IMM results stored separately)
-        rwa_ccr_saccr       = rwa_ccr * 1.15          # conservative SA-CCR ≈ 115% of IMM
+        # Fix 4 (RBC20.11): floor base MUST use SA-CCR (not IMM) even when IMM drives RWA.
+        # After the EAD routing fix, rwa_ccr is now IMM-based.
+        # Recompute SA-CCR standalone from per-portfolio stored values.
+        rwa_ccr_saccr = sum(
+            p["ead_saccr"] * 1.0 * 12.5 * 0.08
+            for p in results["derivative"] if "ead_saccr" in p
+        ) or rwa_ccr * 1.15  # fallback proxy if field missing
         rwa_market_sbm      = results.get("market", {}).get("sbm_capital", rwa_market * 1.10)
         rwa_credit_sa       = rwa_credit * 1.20  # proxy: SA ~20% above A-IRB
         rwa_floor_base_sa   = (rwa_credit_sa + rwa_ccr_saccr +
