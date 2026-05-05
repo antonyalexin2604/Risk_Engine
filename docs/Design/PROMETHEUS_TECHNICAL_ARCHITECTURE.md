@@ -1037,7 +1037,7 @@ services:
       - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
 
   prometheus-app:
-    build: .
+    build: ..
     depends_on:
       - postgres
     ports:
